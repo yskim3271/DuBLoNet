@@ -110,6 +110,7 @@ def create_ort_session(
     providers: Optional[List[str]] = None,
     provider_options: Optional[List[Dict[str, str]]] = None,
     qnn_config: Optional[QNNConfig] = None,
+    num_threads: Optional[int] = None,
     verbose: bool = False,
 ) -> Any:
     """
@@ -125,6 +126,7 @@ def create_ort_session(
         providers: List of execution providers (e.g., ["QNNExecutionProvider", "CPUExecutionProvider"])
         provider_options: List of option dicts matching providers list
         qnn_config: QNNConfig for simplified QNN EP setup (overrides providers/provider_options)
+        num_threads: CPU intra-op thread count for ONNX Runtime
         verbose: Print configuration info
 
     Returns:
@@ -161,6 +163,9 @@ def create_ort_session(
         providers = ["CPUExecutionProvider"]
 
     sess_options = ort.SessionOptions()
+    if num_threads is not None:
+        sess_options.intra_op_num_threads = int(num_threads)
+        sess_options.inter_op_num_threads = 1
 
     # QNN Config takes precedence
     if qnn_config is not None:
@@ -402,6 +407,7 @@ class ONNXLaCoSENet:
         export_opset_version: int = 17,
         force_export: bool = False,
         use_reshape_free: bool = False,
+        num_threads: Optional[int] = None,
         verbose: bool = True,
     ) -> "ONNXLaCoSENet":
         """
@@ -431,6 +437,7 @@ class ONNXLaCoSENet:
             force_export: If True, export ONNX even if onnx_path already exists.
             use_reshape_free: If True, use StatefulReshapeFreeExportableNNCore
                 which eliminates B*F/B*T reshape overhead in TS_BLOCK.
+            num_threads: CPU intra-op thread count for ONNX Runtime.
             verbose: Print loading information
 
         Returns:
@@ -568,6 +575,7 @@ class ONNXLaCoSENet:
             providers=providers,
             provider_options=provider_options,
             qnn_config=qnn_config,
+            num_threads=num_threads,
             verbose=verbose,
         )
 
@@ -643,6 +651,7 @@ class ONNXLaCoSENet:
         qnn_config: Optional[QNNConfig] = None,
         phase_output_mode: Optional[str] = None,
         infer_type: str = "masking",
+        num_threads: Optional[int] = None,
         verbose: bool = True,
     ) -> "ONNXLaCoSENet":
         """
@@ -663,6 +672,7 @@ class ONNXLaCoSENet:
                 If provided, overrides providers/provider_options.
             phase_output_mode: Override for phase output mode. If None, inferred from model outputs.
             infer_type: "masking" or "mapping"
+            num_threads: CPU intra-op thread count for ONNX Runtime.
             verbose: Print loading information
 
         Example:
@@ -705,6 +715,7 @@ class ONNXLaCoSENet:
             providers=providers,
             provider_options=provider_options,
             qnn_config=qnn_config,
+            num_threads=num_threads,
             verbose=verbose,
         )
 
