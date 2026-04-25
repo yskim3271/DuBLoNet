@@ -119,6 +119,7 @@ bash scripts/run_dns_eval_all.sh
 | `method/latency_definition.md` | Algorithmic latency 정의 및 계산식 |
 | `experiments/main_results.md` | 학습 실험 결과 기록 |
 | `experiments/rtf_chunk_sweep.md` | ONNX steady-state RTF chunk sweep |
+| `experiments/ssu_ablation.md` | Selective State Update ablation 근거 |
 | `literature/benchmark_models.md` | 벤치마크 모델 latency/성능 ledger |
 | `literature/latency_conventions.md` | 외부 모델 latency convention 검증 |
 | `literature/related_work_notes.md` | 관련 연구 메모 |

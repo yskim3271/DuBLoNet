@@ -45,11 +45,11 @@ from src.models.streaming.lacosenet import LaCoSENet
 from src.utils import bold
 
 EXPERIMENT_MATRIX = {
-    "M1": {"dir": "M1_12.5ms/s2039", "latency": "12.5ms"},
-    "M2": {"dir": "M2_25.0ms/s2039", "latency": "25.0ms"},
-    "M4": {"dir": "M4_50.0ms/s2039", "latency": "50.0ms"},
-    "M6": {"dir": "M6_75.0ms/s2039", "latency": "75.0ms"},
-    "M7": {"dir": "M7_200.0ms/s2039", "latency": "200.0ms"},
+    "M1": {"model_dir": "M1_12.5ms", "latency": "12.5ms"},
+    "M2": {"model_dir": "M2_25.0ms", "latency": "25.0ms"},
+    "M4": {"model_dir": "M4_50.0ms", "latency": "50.0ms"},
+    "M6": {"model_dir": "M6_75.0ms", "latency": "75.0ms"},
+    "M7": {"model_dir": "M7_200.0ms", "latency": "200.0ms"},
 }
 DEFAULT_CHUNK_SIZES = [1, 16, 64]
 DEFAULT_OUTPUT_DIR = "results/evaluation/ablation_state_guard"
@@ -106,6 +106,8 @@ def main():
                         help="Chunk sizes to sweep (default: 1 16 64)")
     parser.add_argument("--exp_dir", type=str, default="results/experiments",
                         help="Base experiment directory")
+    parser.add_argument("--seed", type=str, default="s2039",
+                        help="Experiment seed subdirectory to evaluate")
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
@@ -127,6 +129,7 @@ def main():
 
     logger.info(f"Models: {models}")
     logger.info(f"Chunk sizes: {args.chunk_sizes}")
+    logger.info(f"Seed: {args.seed}")
     logger.info(f"Device: {args.device}")
 
     # Load dataset once
@@ -141,7 +144,7 @@ def main():
 
     for model_key in models:
         info = EXPERIMENT_MATRIX[model_key]
-        exp_dir = base_dir / info["dir"]
+        exp_dir = base_dir / info["model_dir"] / args.seed
 
         if not exp_dir.exists():
             logger.error(f"Experiment directory not found: {exp_dir}")
@@ -195,6 +198,8 @@ def main():
 
                 result_entry = {
                     "model": model_key,
+                    "seed": args.seed,
+                    "chkpt_file": chkpt_file,
                     "latency_ms": la["latency_ms"],
                     "chunk_size": cs,
                     "guard": guard_label,
