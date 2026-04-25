@@ -18,3 +18,10 @@ paper_works/figures/__pycache__/
 # Local/generated script inputs
 scripts/__pycache__/
 scripts/queues/
+
+# Local RunPod/training orchestration helpers
+scripts/launch_pk_rebuttal.sh
+scripts/monitor_and_train.sh
+scripts/run_ablation_*.sh
+scripts/run_train.sh
+scripts/watch_and_cleanup.sh
