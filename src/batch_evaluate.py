@@ -95,19 +95,57 @@ def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
 
     Returns list of (exp_name, exp_dir) tuples.
     """
+    base_dir = Path(base_dir)
+
+    def is_experiment_dir(path: Path) -> bool:
+        return path.is_dir() and (path / ".hydra" / "config.yaml").exists()
+
+    def display_name(path: Path) -> str:
+        rel = path.relative_to(base_dir)
+        if len(rel.parts) == 2:
+            return f"{rel.parts[0]}_{rel.parts[1]}"
+        return rel.as_posix().replace("/", "_")
+
+    def explicit_candidates(name: str):
+        yield base_dir / name
+
+        # Current layout is results/experiments/<model>/<seed>, while many
+        # sweep manifests use the compact <model>_<seed> form.
+        if "/" not in name:
+            model_name, sep, seed_name = name.rpartition("_")
+            if sep and seed_name.startswith("s") and seed_name[1:].isdigit():
+                yield base_dir / model_name / seed_name
+
     if exp_names is not None:
         # Explicit names (chunksweep mode)
         results = []
         for name in exp_names:
-            d = base_dir / name
-            if not d.exists():
-                logging.getLogger(__name__).error(f"Experiment directory not found: {d}")
+            exp_dir = next((d for d in explicit_candidates(name) if is_experiment_dir(d)), None)
+            if exp_dir is None:
+                logging.getLogger(__name__).error(f"Experiment directory not found: {base_dir / name}")
                 continue
-            results.append((name, d))
+            results.append((display_name(exp_dir), exp_dir))
         return results
 
     # Glob pattern (fullseq / streaming mode)
-    exp_dirs = sorted(base_dir.glob(exp_pattern))
+    glob_patterns = [exp_pattern]
+    if exp_pattern and "/" not in exp_pattern:
+        glob_patterns.append(f"*/{exp_pattern}")
+        if exp_pattern.startswith("*") and exp_pattern.lstrip("*"):
+            glob_patterns.append(f"*/{exp_pattern.lstrip('*')}")
+
+    seen = set()
+    exp_dirs = []
+    for pattern in glob_patterns:
+        for exp_dir in sorted(base_dir.glob(pattern)):
+            if not is_experiment_dir(exp_dir):
+                continue
+            key = exp_dir.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            exp_dirs.append(exp_dir)
+
     if not exp_dirs:
         return []
 
@@ -124,7 +162,7 @@ def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
             f"Split {split_idx}/{split_total}: processing experiments [{start}:{end}]"
         )
 
-    return [(d.name, d) for d in exp_dirs]
+    return [(display_name(d), d) for d in exp_dirs]
 
 
 def compute_streaming_lookahead(conf, chunk_size: int):
@@ -135,8 +173,9 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     """
     enc_ratio = list(conf.model.encoder_padding_ratio)
     dec_ratio = list(conf.model.decoder_padding_ratio)
-    enc_la = compute_lookahead_frames(enc_ratio)
-    dec_la = compute_lookahead_frames(dec_ratio)
+    depth = conf.model.get("dense_depth", 4)
+    enc_la = compute_lookahead_frames(enc_ratio, depth)
+    dec_la = compute_lookahead_frames(dec_ratio, depth)
 
     # Match LaCoSENet streaming wrapper behavior:
     # - input_lookahead_frames = encoder lookahead (no min-2-frame hack needed)
@@ -666,10 +705,20 @@ def run_chunksweep(args):
             )
             model_args = metadata["model_args"]
 
-            hop_size = getattr(model_args, "hop_size", 100)
-            n_fft = getattr(model_args, "n_fft", 400)
-            win_size = getattr(model_args, "win_size", 400)
-            compress_factor = getattr(model_args, "compress_factor", 0.3)
+            def get_model_arg(*names, default):
+                for name in names:
+                    if hasattr(model_args, "get"):
+                        value = model_args.get(name, None)
+                    else:
+                        value = getattr(model_args, name, None)
+                    if value is not None:
+                        return value
+                return default
+
+            hop_size = get_model_arg("hop_len", "hop_size", default=100)
+            n_fft = get_model_arg("fft_len", "n_fft", default=400)
+            win_size = get_model_arg("win_len", "win_size", default=400)
+            compress_factor = get_model_arg("compress_factor", default=0.3)
             freq_size = n_fft // 2 + 1
 
             # Sweep chunk_sizes
@@ -731,7 +780,7 @@ def run_chunksweep(args):
         return
 
     # Comparison vs full-sequence
-    first_exp = args.experiments[0]
+    first_exp = next(iter(all_results), args.experiments[0])
     seed_tag = ""
     for part in first_exp.split("_"):
         if part.startswith("s") and part[1:].isdigit():
