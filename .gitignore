@@ -1,14 +1,20 @@
-paper_works/
 .claude/
 __pycache__/
 *.pyc
 *.log
 *.out
 results/
+data/
 demo/
 baselines/
-scripts/
 ablation/
 debug/
-CLAUDE.md
 evaluation/
+
+# Paper sources are managed, but build products and rebuttal workspace are not.
+paper_works/interspeech2026/
+paper_works/figures/__pycache__/
+
+# Local/generated script inputs
+scripts/__pycache__/
+scripts/queues/
