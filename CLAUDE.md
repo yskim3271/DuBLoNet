@@ -24,7 +24,8 @@ LaCoSENet/
 │   ├── data.py                  # VoiceBankDataset, 세그먼트 샘플링
 │   ├── stft.py                  # mag-phase STFT/iSTFT 유틸리티
 │   ├── compute_metrics.py       # PESQ, STOI 등 메트릭 계산
-│   ├── pcs400.py                # Perceptual Contrast Stretching
+│   ├── data_dns.py              # DNS/paired wav evaluation dataset
+│   ├── evaluate_dns.py          # DNS-style cross-dataset evaluation
 │   ├── receptive_field.py       # 수용장(receptive field) 계산기
 │   ├── utils.py                 # 모델 로드, 체크포인트, 로깅 유틸리티
 │   ├── models/
@@ -60,26 +61,43 @@ LaCoSENet/
 
 ## 주요 커맨드
 
+### 실행 환경
+```bash
+conda activate fullcomplex
+```
+
+- 이 레포의 기본 Python 실행 환경은 `fullcomplex`이다.
+- Rebuttal DNSMOS 평가에는 `speechmos==0.0.1.1`이 필요하며, 해당 환경에 설치되어 있어야 한다.
+
 ### 학습
 ```bash
 python -m src.train                                    # 기본 설정으로 학습
 python -m src.train model.norm_type=batch               # BatchNorm으로 학습
-python -m src.train model.causal=true model.encoder_padding_ratio=[0.5,0.5]  # padding ratio 조절
+python -m src.train model.causal_ts_block=true model.encoder_padding_ratio=[1.0,0.0] model.decoder_padding_ratio=[1.0,0.0]
 python -m src.train hydra.run.dir=./results/experiments/my_exp  # 출력 디렉토리 지정
 ```
 
 ### 평가
 ```bash
-python -m src.evaluate --model_config <exp_dir>/.hydra/config.yaml --chkpt_dir <exp_dir>
+python -m src.evaluate --model_config <exp_dir>/.hydra/config.yaml --chkpt_dir <exp_dir> --chkpt_file model_<step>.th
+python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda
+python -m src.batch_evaluate chunksweep --experiments M1_12.5ms_s2039 --chunk_sizes 1 64 --device cuda
 ```
 
 ### 향상 (Enhancement)
 ```bash
 # 기본 (non-streaming)
-python -m src.enhance --chkpt_dir <exp_dir>
+python -m src.enhance --chkpt_dir <exp_dir> --chkpt_file model_<step>.th
 
 # Streaming (stateful conv)
-python -m src.enhance --chkpt_dir <exp_dir> --use_stateful_conv
+python -m src.enhance --chkpt_dir <exp_dir> --chkpt_file model_<step>.th --use_stateful_conv
+```
+
+### RTF / DNS 재현
+```bash
+python -m src.measure_rtf --chkpt_dir results/experiments/M1_12.5ms/s2039 --chkpt_file auto --use_onnx --chunk_size 8 --output_json results/rtf/M1_cs8.json
+bash scripts/run_rtf_chunk_sweep.sh
+bash scripts/run_dns_eval_all.sh
 ```
 
 ## 문서 구성 (paper_works/)
@@ -96,20 +114,20 @@ python -m src.enhance --chkpt_dir <exp_dir> --use_stateful_conv
 
 | 파일 | 내용 |
 |------|------|
-| `benchmark_comparison.md` | 벤치마크 모델(RNNoise, GaGNet, SEMamba 등) 대비 latency/성능 비교표 |
-| `benchmark_latency_analysis.md` | 벤치마크 모델 latency 분석 |
-| `lacosenet_architecture.md` | LaCoSENet 아키텍처 상세 기술 문서 (코드 기반 분석) |
-| `lacosenet_streaming_context.md` | LaCoSENet 스트리밍 컨텍스트 분석 |
-| `algorithmic_latency_definition.md` | Algorithmic latency 정의 및 분석 |
-| `rtf_experiment_design.md` | RTF 실험 설계서 |
-| `results.md` | 학습 실험 결과 기록 |
-| `references.md` | 관련 논문 레퍼런스 목록 |
+| `method/method_overview.md` | LaCoSENet 아키텍처 및 novelty 정리 |
+| `method/streaming_mechanics.md` | Streaming wrapper, state/lookahead buffer 구현 메모 |
+| `method/latency_definition.md` | Algorithmic latency 정의 및 계산식 |
+| `experiments/main_results.md` | 학습 실험 결과 기록 |
+| `experiments/rtf_chunk_sweep.md` | ONNX steady-state RTF chunk sweep |
+| `literature/benchmark_models.md` | 벤치마크 모델 latency/성능 ledger |
+| `literature/latency_conventions.md` | 외부 모델 latency convention 검증 |
+| `literature/related_work_notes.md` | 관련 연구 메모 |
 | `figures/` | 논문 Figure 생성 스크립트 (plot_latency_vs_pesq.py, figure_style_guide.py) |
 
 ## 설정 (conf/config.yaml)
 
 - Hydra 기반 설정 관리, `hydra.run.dir`로 실험별 디렉토리 자동 생성
-- 주요 모델 파라미터: `causal`, `encoder_padding_ratio`, `decoder_padding_ratio`, `norm_type`, `sca_kernel_size`
+- 주요 모델 파라미터: `causal_ts_block`, `encoder_padding_ratio`, `decoder_padding_ratio`, `norm_type`, `sca_kernel_size`
 - 실험 결과는 `results/experiments/<날짜시간>/`에 저장 (체크포인트, `.hydra/config.yaml`, TensorBoard 로그)
 
 ## 코딩 가이드라인 (Karpathy-derived)
