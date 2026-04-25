@@ -12,7 +12,15 @@ debug/
 evaluation/
 
 # Paper sources are managed, but build products and rebuttal workspace are not.
-paper_works/interspeech2026/
+paper_works/interspeech2026/*.aux
+paper_works/interspeech2026/*.bbl
+paper_works/interspeech2026/*.blg
+paper_works/interspeech2026/*.fls
+paper_works/interspeech2026/*.fdb_latexmk
+paper_works/interspeech2026/*.synctex.gz
+paper_works/interspeech2026/*.pdf
+paper_works/interspeech2026/_backup.tex
+paper_works/interspeech2026/rebuttal/
 paper_works/figures/__pycache__/
 
 # Local/generated script inputs
