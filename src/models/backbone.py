@@ -19,6 +19,14 @@ def _validate_padding_ratio(padding_ratio, name="padding_ratio"):
     assert 0.0 <= left <= 1.0 and 0.0 <= right <= 1.0, \
         f"{name} values must be in [0, 1], got ({left}, {right})"
 
+def _make_norm2d(num_features, norm_type="batch"):
+    if norm_type == "batch":
+        return nn.BatchNorm2d(num_features)
+    elif norm_type == "instance":
+        return nn.InstanceNorm2d(num_features, affine=True)
+    else:
+        raise ValueError(f"Unknown norm_type: {norm_type} (expected 'batch' or 'instance')")
+
 class CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, stride=1, dilation=1, groups=1, bias=True):
         super(CausalConv1d, self).__init__()
@@ -359,7 +367,7 @@ class DS_DDB(nn.Module):
             - Custom ratios: Asymmetric (e.g., (0.8333, 0.1667) for R=5)
             - Must sum to 1.0
     """
-    def __init__(self, dense_channel, kernel_size=(3, 3), depth=4, causal=False, padding_ratio=(0.5, 0.5)):
+    def __init__(self, dense_channel, kernel_size=(3, 3), depth=4, causal=False, padding_ratio=(0.5, 0.5), norm_type="batch"):
         super().__init__()
         self.dense_channel = dense_channel
         self.depth = depth
@@ -382,7 +390,7 @@ class DS_DDB(nn.Module):
                        dil=(dil, 1), pad=padding, groups=dense_channel*(i+1), bias=True),
                 nn.Conv2d(in_channels=dense_channel*(i+1), out_channels=dense_channel,
                          kernel_size=1, padding=0, stride=1, groups=1, bias=True),
-                nn.BatchNorm2d(dense_channel),
+                _make_norm2d(dense_channel, norm_type),
                 nn.PReLU(dense_channel)
             )
             self.dense_block.append(dense_conv)
@@ -406,17 +414,17 @@ class DenseEncoder(nn.Module):
         padding_ratio: (left_ratio, right_ratio) for asymmetric padding (required)
             - Must sum to 1.0
     """
-    def __init__(self, dense_channel, in_channel, depth=4, causal=False, padding_ratio=(0.5, 0.5)):
+    def __init__(self, dense_channel, in_channel, depth=4, causal=False, padding_ratio=(0.5, 0.5), norm_type="batch"):
         super().__init__()
         self.dense_channel = dense_channel
         self.dense_conv_1 = nn.Sequential(
             nn.Conv2d(in_channel, dense_channel, (1, 1)),
-            nn.BatchNorm2d(dense_channel),
+            _make_norm2d(dense_channel, norm_type),
             nn.PReLU(dense_channel))
-        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio)
+        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio, norm_type=norm_type)
         self.dense_conv_2 = nn.Sequential(
             nn.Conv2d(dense_channel, dense_channel, (1, 3), (1, 2)),
-            nn.BatchNorm2d(dense_channel),
+            _make_norm2d(dense_channel, norm_type),
             nn.PReLU(dense_channel))
 
     def forward(self, x):
@@ -446,14 +454,15 @@ class MaskDecoder(nn.Module):
                  out_channel=1,
                  depth=4,
                  causal=False,
-                 padding_ratio=(0.5, 0.5)):
+                 padding_ratio=(0.5, 0.5),
+                 norm_type="batch"):
         super().__init__()
         self.n_fft = n_fft
-        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio)
+        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio, norm_type=norm_type)
         self.mask_conv = nn.Sequential(
             nn.ConvTranspose2d(dense_channel, dense_channel, (1, 3), (1, 2)),
             nn.Conv2d(dense_channel, out_channel, (1, 1)),
-            nn.BatchNorm2d(out_channel),
+            _make_norm2d(out_channel, norm_type),
             nn.PReLU(out_channel),
             nn.Conv2d(out_channel, out_channel, (1, 1))
         )
@@ -483,12 +492,13 @@ class PhaseDecoder(nn.Module):
                  out_channel=1,
                  depth=4,
                  causal=False,
-                 padding_ratio=(0.5, 0.5)):
+                 padding_ratio=(0.5, 0.5),
+                 norm_type="batch"):
         super().__init__()
-        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio)
+        self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio, norm_type=norm_type)
         self.phase_conv = nn.Sequential(
             nn.ConvTranspose2d(dense_channel, dense_channel, (1, 3), (1, 2)),
-            nn.BatchNorm2d(dense_channel),
+            _make_norm2d(dense_channel, norm_type),
             nn.PReLU(dense_channel)
         )
         self.phase_conv_r = nn.Conv2d(dense_channel, out_channel, (1, 1))
@@ -543,7 +553,8 @@ class Backbone(nn.Module):
                  causal_ts_block=False,
                  encoder_padding_ratio=(0.5, 0.5),
                  decoder_padding_ratio=(0.5, 0.5),
-                 sca_kernel_size=11
+                 sca_kernel_size=11,
+                 norm_type="batch"
                  ):
         super().__init__()
         self.win_len = win_len
@@ -563,16 +574,19 @@ class Backbone(nn.Module):
         self.decoder_padding_ratio = decoder_padding_ratio
 
         self.dense_encoder = DenseEncoder(dense_channel, in_channel=2, depth=dense_depth,
-                                         causal=causal_ts_block, padding_ratio=encoder_padding_ratio)
+                                         causal=causal_ts_block, padding_ratio=encoder_padding_ratio,
+                                         norm_type=norm_type)
         self.sequence_block = nn.Sequential(
             *[TS_BLOCK(dense_channel, time_block_num, freq_block_num, time_dw_kernel_size,
                       time_block_kernel, freq_block_kernel, causal=causal_ts_block,
                       sca_kernel_size=sca_kernel_size) for _ in range(num_tsblock)]
         )
         self.mask_decoder = MaskDecoder(dense_channel, fft_len, sigmoid_beta, out_channel=1,
-                                       depth=dense_depth, causal=causal_ts_block, padding_ratio=decoder_padding_ratio)
+                                       depth=dense_depth, causal=causal_ts_block, padding_ratio=decoder_padding_ratio,
+                                       norm_type=norm_type)
         self.phase_decoder = PhaseDecoder(dense_channel, out_channel=1, depth=dense_depth,
-                                         causal=causal_ts_block, padding_ratio=decoder_padding_ratio)
+                                         causal=causal_ts_block, padding_ratio=decoder_padding_ratio,
+                                         norm_type=norm_type)
 
     def forward(self, noisy_com):
         # Input shape: [B, F, T, 2]
