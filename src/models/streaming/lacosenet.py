@@ -398,11 +398,22 @@ class LaCoSENet(nn.Module):
             print(f"  Encoder padding ratio: {enc_padding}")
             print(f"  Decoder padding ratio: {dec_padding}")
 
-        # Get STFT parameters
-        hop_size = getattr(model_params, 'hop_size', 100)
-        n_fft = getattr(model_params, 'n_fft', 400)
-        win_size = getattr(model_params, 'win_size', 400)
-        compress_factor = getattr(model_params, 'compress_factor', 0.3)
+        def get_model_param(*names: str, default: Any) -> Any:
+            for name in names:
+                if hasattr(model_params, "get"):
+                    value = model_params.get(name, None)
+                else:
+                    value = getattr(model_params, name, None)
+                if value is not None:
+                    return value
+            return default
+
+        # Get STFT parameters. Training configs use hop_len/fft_len/win_len;
+        # keep the older aliases for compatibility with external checkpoints.
+        hop_size = get_model_param("hop_len", "hop_size", default=100)
+        n_fft = get_model_param("fft_len", "n_fft", default=400)
+        win_size = get_model_param("win_len", "win_size", default=400)
+        compress_factor = get_model_param("compress_factor", default=0.3)
 
         # Calculate freq_size from actual encoder output (not STFT bins)
         # DenseEncoder's dense_conv_2 has stride=(1,2), halving freq dimension
@@ -436,6 +447,10 @@ class LaCoSENet(nn.Module):
             "rf_block_count": rf_block_count,
             "model_class": "Backbone",
         }
+
+        # The dummy forward above runs through stateful encoder layers after model
+        # conversion. Return a clean wrapper state for the first real stream.
+        instance.reset_state()
 
         if verbose:
             print(f"  Chunk size: {chunk_size} frames")
@@ -534,9 +549,13 @@ class LaCoSENet(nn.Module):
         if self.rf_sequence_block is None or self._rf_states is None:
             raise RuntimeError("Reshape-free sequence block not initialized")
 
+        from src.models.streaming.utils import get_state_frames_context
+
+        state_frames = get_state_frames_context()
+
         # Process through each TS_BLOCK with state
         for i, rf_block in enumerate(self.rf_sequence_block):
-            x, new_states = rf_block(x, self._rf_states[i])
+            x, new_states = rf_block(x, self._rf_states[i], state_frames=state_frames)
             self._rf_states[i] = new_states
 
         return x
