@@ -284,7 +284,7 @@ class ONNXLaCoSENet:
         self.encoder_lookahead = encoder_lookahead
         self.decoder_lookahead = decoder_lookahead
         self.stft_lookahead_frames = max(1, int(stft_lookahead_frames))
-        self.input_lookahead_frames = max(self.stft_lookahead_frames, int(encoder_lookahead))
+        self.input_lookahead_frames = int(encoder_lookahead)
         self.total_lookahead = self.input_lookahead_frames + decoder_lookahead
 
         # STFT parameters
@@ -511,15 +511,14 @@ class ONNXLaCoSENet:
             )
 
         # Step 3: Export to ONNX
-        # Export time_frames must cover the full inference window used by this wrapper.
+        # Export time_frames must cover the model inference window used by this wrapper.
         # We need:
-        # - input_lookahead_frames: max(STFT lookahead, encoder lookahead)
+        # - encoder_lookahead: future context required by asymmetric encoder layers
         # - decoder_lookahead: additional future context required by asymmetric decoder
         # This matches the PyTorch buffered streaming design where the decoder consumes
         # an extended window (current + lookahead) while state updates advance only
         # by chunk_size frames per step.
-        stft_lookahead = 1  # STFT center=True emulation
-        input_lookahead_frames = max(stft_lookahead, encoder_lookahead)
+        input_lookahead_frames = int(encoder_lookahead)
         export_time_frames = chunk_size + input_lookahead_frames + decoder_lookahead
 
         if onnx_path is None:
@@ -865,13 +864,9 @@ class ONNXLaCoSENet:
 
         Used when decoder_lookahead == 0.
 
-        ONNX model is exported with time_frames = chunk_size + stft_lookahead_frames.
-        We process all frames_for_istft frames through ONNX to get proper mask/phase
-        predictions for the entire region needed by iSTFT.
-
-        Note: This causes ONNX to update states for 1 more frame per chunk than
-        PyTorch's StateFramesContext would allow, but the quality improvement from
-        processing the lookahead frame outweighs the state drift.
+        ONNX model is exported with the same model lookahead as the PyTorch wrapper.
+        STFT lookahead is kept separate from model lookahead so it does not inflate
+        reported algorithmic latency.
 
         Args:
             mag: Magnitude spectrogram [B, F, T] where T >= chunk_size
@@ -881,7 +876,7 @@ class ONNXLaCoSENet:
             Tuple of (est_mag, est_pha) for iSTFT
         """
         B, F, T = mag.shape
-        # Use input_lookahead_frames which accounts for both stft_lookahead and encoder_lookahead
+        # Use model input lookahead only; STFT lookahead is not model latency.
         frames_for_model = self.chunk_size + self.input_lookahead_frames
         frames_for_istft = self.chunk_size + self.stft_lookahead_frames
 
