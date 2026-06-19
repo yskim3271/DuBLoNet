@@ -31,17 +31,5 @@ ckpts/
 *.onnx
 *.safetensors
 
-# Local/generated script inputs
-scripts/__pycache__/
-scripts/queues/
-
-# Local experiment sweep/orchestration helpers
-scripts/launch_pk_rebuttal.sh
-scripts/monitor_and_train.sh
-scripts/run_dns_eval_all.sh
-scripts/run_rtf_chunk_sweep.sh
-scripts/run_rtf_experiments.sh
-scripts/sweep_rtf_variations.sh
-scripts/run_ablation_*.sh
-scripts/run_train.sh
-scripts/watch_and_cleanup.sh
+# Local experiment and utility scripts.
+scripts/

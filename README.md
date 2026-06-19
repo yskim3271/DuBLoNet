@@ -10,9 +10,9 @@ context, lookahead buffers for future context, and selective state updates to
 avoid future-frame leakage across chunks.
 
 This repository contains the model, training pipeline, streaming wrappers, ONNX
-export utilities, and evaluation scripts used for the LaCo-SENet experiments.
-Paper-writing materials, local datasets, checkpoints, and generated results are
-not tracked in this code repository.
+export utilities, and evaluation entry points used for the LaCo-SENet
+experiments. Paper-writing materials, local datasets, checkpoints, generated
+results, and local utility scripts are not tracked in this code repository.
 
 ## Repository Layout
 
@@ -21,7 +21,6 @@ not tracked in this code repository.
 | `src/` | Training, evaluation, STFT, metrics, and model implementation. |
 | `src/models/streaming/` | Chunk-wise LaCo-SENet streaming modules and stateful layers. |
 | `src/models/onnx_export/` | Exportable streaming core and ONNX Runtime wrapper. |
-| `scripts/` | Dataset export, DNS evaluation wrappers, and result aggregation utilities. |
 | `conf/config.yaml` | Default Hydra configuration for VoiceBank+DEMAND training. |
 | `requirements.txt` | Python dependencies. |
 
