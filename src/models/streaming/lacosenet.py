@@ -32,7 +32,7 @@ This approach provides:
 
 Example (decoder-only asymmetric):
     >>> streaming = LaCoSENet.from_checkpoint(
-    ...     chkpt_dir="results/experiments/prk_1117_1",
+    ...     chkpt_dir="path/to/checkpoint",
     ...     chunk_size=64,
     ...     encoder_lookahead=0,   # Encoder is causal
     ...     decoder_lookahead=7,   # Decoder needs 7 frame lookahead
@@ -40,7 +40,7 @@ Example (decoder-only asymmetric):
 
 Example (both encoder and decoder asymmetric):
     >>> streaming = LaCoSENet.from_checkpoint(
-    ...     chkpt_dir="results/experiments/prk_1114_2",
+    ...     chkpt_dir="path/to/checkpoint",
     ...     chunk_size=64,
     ...     encoder_lookahead=7,   # Encoder needs 7 frame lookahead
     ...     decoder_lookahead=7,   # Decoder needs 7 frame lookahead
@@ -82,9 +82,9 @@ class LaCoSENet(nn.Module):
     Supported model configurations:
     - **Fully Causal**: encoder_lookahead=0, decoder_lookahead=0
     - **Asymmetric Decoder Only**: encoder_lookahead=0, decoder_lookahead>0
-      Example: prk_1117_1 with decoder_padding_ratio=(0.77, 0.23)
+      Example: decoder_padding_ratio=(0.77, 0.23)
     - **Asymmetric Encoder+Decoder**: encoder_lookahead>0, decoder_lookahead>0
-      Example: prk_1114_2 with both enc/dec having (0.77, 0.23) ratio
+      Example: encoder/decoder padding_ratio=(0.77, 0.23)
 
     Processing pipeline:
 

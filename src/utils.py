@@ -315,7 +315,7 @@ def parse_file_list(directory: str, list_file: str) -> List[str]:
         List of full file paths
 
     Example:
-        >>> noise_files = parse_file_list("/data/noise", "dataset/noise_train.txt")
+        >>> noise_files = parse_file_list("data/noise", "dataset/noise_train.txt")
     """
     with open(list_file, 'r') as f:
         return [os.path.join(directory, line.strip()) for line in f]

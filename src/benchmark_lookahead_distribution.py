@@ -20,8 +20,8 @@ concat/slicing, while A/C (buffered) incur per-chunk buffer management.
 
 Usage:
     python -m src.benchmark_lookahead_distribution \\
-        --chkpt_dir results/experiments/M6_62.5ms/s2039 \\
-        --chkpt_file model_163000.th \\
+        --chkpt_dir path/to/checkpoint \\
+        --chkpt_file best.th \\
         --total_lookahead 14 \\
         --chunk_sizes 1,4,16,64 \\
         --warmup 3 --repeats 5 \\

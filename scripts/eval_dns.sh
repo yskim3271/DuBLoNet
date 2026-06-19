@@ -6,10 +6,10 @@
 #
 # Example:
 #   bash scripts/eval_dns.sh \
-#       results/experiments/M1_12.5ms/s42 \
+#       path/to/checkpoint \
 #       best.th \
 #       data/dns2020/DNS-Challenge/datasets/test_set/synthetic/no_reverb \
-#       results/rebuttal/dns_eval/M1_s42.json
+#       results/dns_eval/example.json
 
 set -euo pipefail
 

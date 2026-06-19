@@ -5,9 +5,9 @@ VoiceBank for rebuttal experiment D (DNSMOS on in-distribution test data).
 
 Usage:
     # Full test set (824 pairs, ~500 MB):
-    python scripts/smoketest_export_voicebank.py --n -1 --dest /tmp/vb_full
+    python scripts/smoketest_export_voicebank.py --n -1 --dest data/voicebank_full
     # First 5 pairs (smoke test):
-    python scripts/smoketest_export_voicebank.py --n 5 --dest /tmp/vb_smoketest
+    python scripts/smoketest_export_voicebank.py --n 5 --dest data/voicebank_smoketest
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from tqdm import tqdm
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=5, help="Number of pairs to export; -1 for all.")
-    ap.add_argument("--dest", type=str, default="/tmp/vb_smoketest")
+    ap.add_argument("--dest", type=str, default="data/voicebank_smoketest")
     ap.add_argument("--dataset", type=str, default="JacobLinCool/VoiceBank-DEMAND-16k")
     ap.add_argument("--skip_existing", action="store_true", help="Skip pairs already present at dest.")
     args = ap.parse_args()

@@ -409,7 +409,7 @@ def prepare_streaming_model(
 
     Example:
         >>> model, meta = prepare_streaming_model(
-        ...     "results/experiments/prk_taps_mask",
+        ...     "path/to/checkpoint",
         ... )
         >>> print(meta["model_args"].dense_channel)
     """

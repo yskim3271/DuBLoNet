@@ -13,7 +13,7 @@ Key features:
 Usage:
     # Create from checkpoint (exports ONNX automatically)
     streaming = ONNXLaCoSENet.from_checkpoint(
-        chkpt_dir="results/experiments/prk_1117_1",
+        chkpt_dir="path/to/checkpoint",
         chunk_size=64,
         encoder_lookahead=0,
         decoder_lookahead=7,
@@ -142,7 +142,7 @@ def create_ort_session(
             htp_performance_mode="burst",
             soc_model="SM8550",
             context_cache_enabled=True,
-            context_cache_path="/data/local/tmp/model_qnn_ctx.onnx",
+            context_cache_path="model_qnn_ctx.onnx",
         )
         session = create_ort_session(path, qnn_config=qnn_cfg)
 

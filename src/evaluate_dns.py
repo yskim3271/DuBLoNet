@@ -10,13 +10,13 @@ changes.
 Example::
 
     python -m src.evaluate_dns \
-        --model_config results/experiments/M1_12.5ms/s42/.hydra/config.yaml \
-        --chkpt_dir   results/experiments/M1_12.5ms/s42 \
+        --model_config path/to/checkpoint/.hydra/config.yaml \
+        --chkpt_dir   path/to/checkpoint \
         --chkpt_file  best.th \
-        --noisy_dir   /data/dns2020/no_reverb/noisy \
-        --clean_dir   /data/dns2020/no_reverb/clean \
+        --noisy_dir   data/dns2020/no_reverb/noisy \
+        --clean_dir   data/dns2020/no_reverb/clean \
         --layout      dns2020 \
-        --out_json    results/rebuttal/dns_eval/M1_s42.json
+        --out_json    results/dns_eval/example.json
 """
 
 from __future__ import annotations
