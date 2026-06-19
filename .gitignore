@@ -33,3 +33,9 @@ ckpts/
 
 # Local experiment and utility scripts.
 scripts/
+
+# Local auxiliary experiments and rebuttal-only evaluation code.
+src/ablation_state_guard.py
+src/benchmark_lookahead_distribution.py
+src/data_dns.py
+src/evaluate_dns.py
