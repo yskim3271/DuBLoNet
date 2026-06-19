@@ -1,7 +1,7 @@
 """Aggregate DNS-style evaluation JSONs into a per-(model, dataset) summary.
 
-Reads ``results/rebuttal/dns_eval/{D,C}_<MODEL>_<SEED>_<dataset>.json`` produced
-by ``scripts/run_dns_eval_all.sh`` and emits:
+Reads DNS-style evaluation JSONs matching
+``{D,C}_<MODEL>_<SEED>_<dataset>.json`` and emits:
 
   - markdown table to stdout (or --md-out)
   - CSV (--csv-out)

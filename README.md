@@ -21,7 +21,7 @@ not tracked in this code repository.
 | `src/` | Training, evaluation, STFT, metrics, and model implementation. |
 | `src/models/streaming/` | Chunk-wise LaCo-SENet streaming modules and stateful layers. |
 | `src/models/onnx_export/` | Exportable streaming core and ONNX Runtime wrapper. |
-| `scripts/` | Dataset export, DNS evaluation, RTF measurement, and batch scripts. |
+| `scripts/` | Dataset export, DNS evaluation wrappers, and result aggregation utilities. |
 | `conf/config.yaml` | Default Hydra configuration for VoiceBank+DEMAND training. |
 | `requirements.txt` | Python dependencies. |
 
@@ -77,4 +77,3 @@ python src/measure_rtf.py \
   year      = {2026}
 }
 ```
-
