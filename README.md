@@ -3,6 +3,9 @@
 Latency-configurable streaming speech enhancement via asymmetric temporal
 padding.
 
+Paper: [arXiv:2606.19688](https://arxiv.org/abs/2606.19688) (accepted for
+presentation at Interspeech 2026)
+
 LaCo-SENet exposes a single padding-ratio hyperparameter that trades algorithmic
 latency for enhancement quality while keeping the backbone architecture and
 parameter budget fixed. The streaming implementation uses state buffers for past
