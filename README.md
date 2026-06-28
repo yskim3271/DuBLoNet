@@ -41,6 +41,48 @@ symmetric encoder padding. For LaCo-SENet, `L` abbreviates `L_enc=L_dec`; the
 | LaCo-SENet (`L=15`, upper bound) | 2026 | 200.0 ms | 1.37M | 3.47 | .957 | 4.69 | 3.79 | 4.17 |
 | PrimeK-Net | 2025 | non-causal | 1.41M | 3.61 | - | 4.81 | 3.98 | 4.35 |
 
+## Pretrained Checkpoints
+
+The VoiceBank+DEMAND checkpoints used for the reported LaCo-SENet results are
+available on Hugging Face:
+[yskim3271/lacosenet-voicebank-demand](https://huggingface.co/yskim3271/lacosenet-voicebank-demand).
+
+The release includes the best-validation checkpoints for 9 latency
+configurations and 3 random seeds. Each checkpoint directory contains the
+PyTorch weights and the corresponding Hydra config required by the loader.
+See the Hugging Face `manifest.json` for all checkpoint paths, SHA256 checksums,
+latency settings, seeds, and test metrics.
+
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="yskim3271/lacosenet-voicebank-demand",
+    local_dir="checkpoints/lacosenet-voicebank-demand",
+)
+PY
+```
+
+Example evaluation:
+
+```bash
+python -m src.evaluate \
+  --chkpt_dir checkpoints/lacosenet-voicebank-demand/M6_75.0ms/s2039 \
+  --chkpt_file model_163000.th \
+  --device cuda
+```
+
+Example streaming RTF measurement:
+
+```bash
+python -m src.measure_rtf \
+  --chkpt_dir checkpoints/lacosenet-voicebank-demand/M6_75.0ms/s2039 \
+  --chkpt_file model_163000.th \
+  --chunk_size 8 \
+  --use_onnx
+```
+
 ## Repository Layout
 
 | Path | Purpose |
