@@ -90,6 +90,34 @@ def create_data_loader(hf_dataset, conf, num_workers):
     )
 
 
+def is_latency_expert_config(conf) -> bool:
+    return conf.model.get("type", "backbone") == "latency_expert_backbone"
+
+
+def get_config_latency_ids(conf, requested=None):
+    if not is_latency_expert_config(conf):
+        return [None]
+
+    configured = list(conf.model.latency_expert.latency_ids)
+    if requested:
+        unknown = sorted(set(requested) - set(configured))
+        if unknown:
+            raise ValueError(f"Unknown latency ids {unknown}; configured ids are {configured}")
+        return list(requested)
+
+    return configured
+
+
+def result_name_for_latency(exp_name, latency_id):
+    return f"{exp_name}_{latency_id}" if latency_id else exp_name
+
+
+def forward_model(model, noisy_com, latency_id=None):
+    if latency_id is not None:
+        return model(noisy_com, latency_id=latency_id)
+    return model(noisy_com)
+
+
 def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
     """Find experiment directories by glob pattern or explicit names.
 
@@ -165,17 +193,42 @@ def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
     return [(display_name(d), d) for d in exp_dirs]
 
 
-def compute_streaming_lookahead(conf, chunk_size: int):
+def compute_streaming_lookahead(
+    conf,
+    chunk_size: int,
+    latency_id=None,
+    sample_rate=None,
+):
     """Compute streaming lookahead info from model config.
 
     Returns dict with encoder_lookahead, decoder_lookahead, total_lookahead,
     latency_ms, hop_size, sample_rate, etc.
     """
-    enc_ratio = list(conf.model.encoder_padding_ratio)
-    dec_ratio = list(conf.model.decoder_padding_ratio)
+    if is_latency_expert_config(conf):
+        latency_ids = get_config_latency_ids(conf)
+        if latency_id is None:
+            latency_id = conf.model.latency_expert.get("default_latency_id", latency_ids[0])
+        latency_config = conf.model.latency_expert
+        future_frames = latency_config.get("future_frames")
+        if future_frames is not None:
+            from src.v2_contract import decoder_padding_ratios_for_future_frames
+
+            enc_ratio = [1.0, 0.0]
+            dec_ratio = decoder_padding_ratios_for_future_frames(
+                dict(future_frames), depth=conf.model.get("dense_depth", 4)
+            )[latency_id]
+        else:
+            enc_ratio = list(latency_config.encoder_padding_ratios[latency_id])
+            dec_ratio = list(latency_config.decoder_padding_ratios[latency_id])
+    else:
+        enc_ratio = list(conf.model.encoder_padding_ratio)
+        dec_ratio = list(conf.model.decoder_padding_ratio)
     depth = conf.model.get("dense_depth", 4)
     enc_la = compute_lookahead_frames(enc_ratio, depth)
-    dec_la = compute_lookahead_frames(dec_ratio, depth)
+    if is_latency_expert_config(conf) and conf.model.latency_expert.get("future_frames") is not None:
+        dec_la = int(conf.model.latency_expert.future_frames[latency_id])
+    else:
+        dec_la = compute_lookahead_frames(dec_ratio, depth)
 
     # Match LaCoSENet streaming wrapper behavior:
     # - input_lookahead_frames = encoder lookahead (no min-2-frame hack needed)
@@ -183,15 +236,24 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     input_la = int(enc_la)
     total_la = input_la + dec_la
 
-    hop_size = conf.model.get("hop_len", 100)
-    sample_rate = conf.get("sampling_rate", 16000)
-    win_size = conf.model.get("win_len", 400)
+    sample_rate = int(sample_rate or conf.get("sampling_rate", 16000))
+    sfi_config = conf.model.get("sfi", {})
+    if sfi_config.get("enabled", False):
+        from src.v2_contract import sfi_profile_from_config
+
+        profile = sfi_profile_from_config(sfi_config, sample_rate)
+        hop_size = profile.hop_len
+        win_size = profile.win_len
+    else:
+        hop_size = conf.model.get("hop_len", 100)
+        win_size = conf.model.get("win_len", 400)
     stft_center_delay_samples = win_size // 2  # STFT future buffering delay
     latency_ms = (total_la * hop_size + stft_center_delay_samples) / sample_rate * 1000
 
     return {
         "enc_ratio": enc_ratio,
         "dec_ratio": dec_ratio,
+        "latency_id": latency_id,
         "encoder_lookahead": enc_la,
         "decoder_lookahead": dec_la,
         "input_lookahead": input_la,
@@ -208,7 +270,7 @@ def compute_streaming_lookahead(conf, chunk_size: int):
 # Section 3: Evaluation functions (per-mode)
 # ============================================================================
 
-def evaluate_fullseq_single(model, data_loader, stft_args, device, logger):
+def evaluate_fullseq_single(model, data_loader, stft_args, device, logger, latency_id=None):
     """Run full-sequence evaluation, return dict of metrics."""
     from src.stft import mag_pha_stft, mag_pha_istft
 
@@ -220,7 +282,9 @@ def evaluate_fullseq_single(model, data_loader, stft_args, device, logger):
             noisy, clean, _, _ = data
 
             noisy_com = mag_pha_stft(noisy, **stft_args)[2].to(device)
-            clean_mag_hat, clean_pha_hat, _ = model(noisy_com)
+            clean_mag_hat, clean_pha_hat, _ = forward_model(
+                model, noisy_com, latency_id=latency_id
+            )
             clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **stft_args)
 
             clean_np = clean.squeeze().detach().cpu().numpy()
@@ -451,20 +515,29 @@ def run_fullseq(args):
             stft_args = get_stft_args_from_config(conf.model)
             model = load_model(conf.model, args.device)
             model = load_checkpoint(model, str(exp_dir), chkpt_file, args.device)
+            latency_ids = get_config_latency_ids(conf, requested=args.latency_ids)
 
-            metrics = evaluate_fullseq_single(model, ev_loader, stft_args, args.device, logger)
+            for latency_id in latency_ids:
+                display_latency = latency_id or "default"
+                logger.info(f"  Fullseq latency_id: {display_latency}")
+                metrics = evaluate_fullseq_single(
+                    model, ev_loader, stft_args, args.device, logger,
+                    latency_id=latency_id,
+                )
 
-            all_results[exp_name] = {
-                "best_step": best_step,
-                "valid_pesq": best_info["valid_pesq"],
-                "test_metrics": metrics,
-            }
+                result_name = result_name_for_latency(exp_name, latency_id)
+                all_results[result_name] = {
+                    "best_step": best_step,
+                    "valid_pesq": best_info["valid_pesq"],
+                    "latency_id": latency_id,
+                    "test_metrics": metrics,
+                }
 
-            logger.info(
-                bold(f"Results: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
-                     f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
-                     f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
-            )
+                logger.info(
+                    bold(f"Results [{display_latency}]: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
+                         f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
+                         f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
+                )
 
             del model
             torch.cuda.empty_cache()
@@ -489,13 +562,13 @@ def run_fullseq(args):
     logger.info(bold(f"\n{'='*80}"))
     logger.info(bold("SUMMARY"))
     logger.info(bold(f"{'='*80}"))
-    header = f"{'Experiment':<25} {'Step':>7} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
+    header = f"{'Experiment':<25} {'LatID':>6} {'Step':>7} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
     logger.info(header)
     logger.info("-" * 80)
     for exp_name, result in all_results.items():
         m = result["test_metrics"]
         logger.info(
-            f"{exp_name:<25} {result['best_step']:>7} "
+            f"{exp_name:<25} {str(result.get('latency_id') or '-'):>6} {result['best_step']:>7} "
             f"{m['pesq']:>7.4f} {m['stoi']:>7.4f} {m['csig']:>7.4f} "
             f"{m['cbak']:>7.4f} {m['covl']:>7.4f}"
         )
@@ -559,59 +632,68 @@ def run_streaming(args):
                 continue
 
             conf = OmegaConf.load(config_path)
-
-            la = compute_streaming_lookahead(conf, chunk_size=args.chunk_size)
-            logger.info(f"  Padding ratio: enc={la['enc_ratio']}, dec={la['dec_ratio']}")
-            logger.info(f"  Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, total={la['total_lookahead']}")
-            logger.info(f"  Latency: {la['latency_ms']:.2f}ms, chunk_size: {args.chunk_size}")
+            latency_ids = get_config_latency_ids(conf, requested=args.latency_ids)
 
             ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
 
-            streaming = LaCoSENet.from_checkpoint(
-                chkpt_dir=str(exp_dir),
-                chkpt_file=chkpt_file,
-                chunk_size=args.chunk_size,
-                encoder_lookahead=la["encoder_lookahead"],
-                decoder_lookahead=la["decoder_lookahead"],
-                device=args.device,
-                verbose=False,
-            )
+            for latency_id in latency_ids:
+                display_latency = latency_id or "default"
+                la = compute_streaming_lookahead(
+                    conf, chunk_size=args.chunk_size, latency_id=latency_id
+                )
+                logger.info(f"  Latency id: {display_latency}")
+                logger.info(f"  Padding ratio: enc={la['enc_ratio']}, dec={la['dec_ratio']}")
+                logger.info(f"  Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, total={la['total_lookahead']}")
+                logger.info(f"  Latency: {la['latency_ms']:.2f}ms, chunk_size: {args.chunk_size}")
 
-            shift_samples = la["stft_center_delay_samples"] if align_ola else 0
-            metrics = evaluate_streaming_single(
-                streaming, ev_loader, args.device, logger,
-                shift_samples=shift_samples,
-            )
+                streaming = LaCoSENet.from_checkpoint(
+                    chkpt_dir=str(exp_dir),
+                    chkpt_file=chkpt_file,
+                    chunk_size=args.chunk_size,
+                    encoder_lookahead=la["encoder_lookahead"],
+                    decoder_lookahead=la["decoder_lookahead"],
+                    latency_id=latency_id,
+                    device=args.device,
+                    verbose=False,
+                )
 
-            all_results[exp_name] = {
-                "best_step": best_step,
-                "valid_pesq": best_info["valid_pesq"],
-                "chunk_size": args.chunk_size,
-                "encoder_lookahead": la["encoder_lookahead"],
-                "decoder_lookahead": la["decoder_lookahead"],
-                "latency_ms": la["latency_ms"],
-                "align_ola": align_ola,
-                "shift_samples": shift_samples,
-                "test_metrics": metrics,
-            }
+                shift_samples = la["stft_center_delay_samples"] if align_ola else 0
+                metrics = evaluate_streaming_single(
+                    streaming, ev_loader, args.device, logger,
+                    shift_samples=shift_samples,
+                )
 
-            logger.info(
-                bold(f"Results: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
-                     f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
-                     f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
-            )
+                result_name = result_name_for_latency(exp_name, latency_id)
+                all_results[result_name] = {
+                    "best_step": best_step,
+                    "valid_pesq": best_info["valid_pesq"],
+                    "latency_id": latency_id,
+                    "chunk_size": args.chunk_size,
+                    "encoder_lookahead": la["encoder_lookahead"],
+                    "decoder_lookahead": la["decoder_lookahead"],
+                    "latency_ms": la["latency_ms"],
+                    "align_ola": align_ola,
+                    "shift_samples": shift_samples,
+                    "test_metrics": metrics,
+                }
 
-            # Incremental save — write after each experiment
-            output_json = dict(all_results)
-            comparison = generate_streaming_comparison(all_results, fullseq_json_path, logger)
-            if comparison:
-                output_json["_comparison"] = comparison
-            with open(json_path, "w") as f:
-                json.dump(output_json, f, indent=2)
-            logger.info(f"  [{len(all_results)}/{len(experiments)}] saved → {json_path}")
+                logger.info(
+                    bold(f"Results [{display_latency}]: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
+                         f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
+                         f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
+                )
 
-            del streaming
-            torch.cuda.empty_cache()
+                # Incremental save — write after each latency id
+                output_json = dict(all_results)
+                comparison = generate_streaming_comparison(all_results, fullseq_json_path, logger)
+                if comparison:
+                    output_json["_comparison"] = comparison
+                with open(json_path, "w") as f:
+                    json.dump(output_json, f, indent=2)
+                logger.info(f"  [{len(all_results)} results] saved → {json_path}")
+
+                del streaming
+                torch.cuda.empty_cache()
 
         except Exception as e:
             logger.error(f"Failed to evaluate {exp_name}: {e}")
@@ -629,13 +711,13 @@ def run_streaming(args):
     logger.info(bold(f"\n{'='*80}"))
     logger.info(bold("SUMMARY"))
     logger.info(bold(f"{'='*80}"))
-    header = f"{'Experiment':<25} {'Step':>7} {'Lat(ms)':>8} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
+    header = f"{'Experiment':<25} {'LatID':>6} {'Step':>7} {'Lat(ms)':>8} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
     logger.info(header)
     logger.info("-" * 80)
     for exp_name, result in all_results.items():
         m = result["test_metrics"]
         logger.info(
-            f"{exp_name:<25} {result['best_step']:>7} "
+            f"{exp_name:<25} {str(result.get('latency_id') or '-'):>6} {result['best_step']:>7} "
             f"{result['latency_ms']:>8.2f} "
             f"{m['pesq']:>7.4f} {m['stoi']:>7.4f} {m['csig']:>7.4f} "
             f"{m['cbak']:>7.4f} {m['covl']:>7.4f}"
@@ -704,6 +786,16 @@ def run_chunksweep(args):
                 verbose=False,
             )
             model_args = metadata["model_args"]
+            latency_id = args.latency_id
+            if is_latency_expert_config(conf):
+                valid_latency_ids = get_config_latency_ids(conf)
+                if latency_id is None:
+                    latency_id = conf.model.latency_expert.get("default_latency_id", valid_latency_ids[0])
+                if latency_id not in valid_latency_ids:
+                    raise ValueError(
+                        f"Unknown latency_id '{latency_id}'; configured ids are {valid_latency_ids}"
+                    )
+                model.set_latency_id(latency_id)
 
             def get_model_arg(*names, default):
                 for name in names:
@@ -725,7 +817,7 @@ def run_chunksweep(args):
             chunk_results = {}
 
             for cs in args.chunk_sizes:
-                la = compute_streaming_lookahead(conf, chunk_size=cs)
+                la = compute_streaming_lookahead(conf, chunk_size=cs, latency_id=latency_id)
                 logger.info(f"  [cs={cs}] Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, "
                             f"total={la['total_lookahead']}, latency={la['latency_ms']:.2f}ms")
 
@@ -758,8 +850,10 @@ def run_chunksweep(args):
                 chunk_results[str(cs)] = metrics
                 del lacosenet
 
-            all_results[exp_name] = {
+            result_name = result_name_for_latency(exp_name, latency_id)
+            all_results[result_name] = {
                 "best_step": best_step,
+                "latency_id": latency_id,
                 "encoder_lookahead": la["encoder_lookahead"],
                 "decoder_lookahead": la["decoder_lookahead"],
                 "latency_ms": la["latency_ms"],
@@ -881,6 +975,8 @@ examples:
                         help="Glob pattern to match experiment directories.")
     p_full.add_argument("--split", type=str, default=None,
                         help="Split experiments: 'INDEX/TOTAL' (e.g., '0/2')")
+    p_full.add_argument("--latency_ids", type=str, nargs="+", default=None,
+                        help="Latency ids for latency-expert checkpoints (default: all configured ids).")
     p_full.set_defaults(func=run_fullseq)
 
     # --- streaming ---
@@ -896,6 +992,8 @@ examples:
                           help="Compensate OLA center shift (win_size//2 samples)")
     p_stream.add_argument("--split", type=str, default=None,
                           help="Split experiments: 'INDEX/TOTAL' (e.g., '0/2')")
+    p_stream.add_argument("--latency_ids", type=str, nargs="+", default=None,
+                          help="Latency ids for latency-expert checkpoints (default: all configured ids).")
     p_stream.set_defaults(func=run_streaming)
 
     # --- chunksweep ---
@@ -910,6 +1008,8 @@ examples:
                          help="Chunk sizes (STFT frames) to sweep.")
     p_sweep.add_argument("--align_ola", action="store_true",
                          help="Compensate OLA center shift (win_size//2 samples)")
+    p_sweep.add_argument("--latency_id", type=str, default=None,
+                         help="Latency id for a latency-expert checkpoint (default: configured default).")
     p_sweep.set_defaults(func=run_chunksweep)
 
     return parser

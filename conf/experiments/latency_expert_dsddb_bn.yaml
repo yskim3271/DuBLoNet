@@ -1,0 +1,95 @@
+# @package _global_
+defaults:
+  - _self_
+  - override /hydra/job_logging: colorlog
+  - override /hydra/hydra_logging: colorlog
+
+dset:
+  hf_dataset_id: JacobLinCool/VoiceBank-DEMAND-16k
+  segment: auto
+
+model:
+  type: latency_expert_backbone
+  win_len: 400
+  hop_len: 100
+  fft_len: 400
+  compress_factor: 0.3
+  dense_channel: 64
+  sigmoid_beta: 2.0
+  num_tsblock: 4
+  dense_depth: 4
+  time_dw_kernel_size: 3
+  time_block_kernel: [3, 5, 7, 11]
+  freq_block_kernel: [3, 11, 23, 31]
+  time_block_num: 2
+  freq_block_num: 2
+  causal_ts_block: true
+  encoder_padding_ratio: [0.90, 0.10]
+  decoder_padding_ratio: [0.90, 0.10]
+  sca_kernel_size: 11
+  norm_type: batch
+  latency_expert:
+    latency_ids: [L0, L1, L3, L5]
+    default_latency_id: L3
+    topology: encoder_decoder
+    expert_scope: dsddb_bn
+    latency_sampling: uniform
+    encoder_padding_ratios:
+      L0: [1.00, 0.00]
+      L1: [0.96, 0.04]
+      L3: [0.90, 0.10]
+      L5: [0.84, 0.16]
+    decoder_padding_ratios:
+      L0: [1.00, 0.00]
+      L1: [0.96, 0.04]
+      L3: [0.90, 0.10]
+      L5: [0.84, 0.16]
+
+sampling_rate: 16000
+
+batch_size: 8
+max_steps: 400000
+
+log_interval: 500
+summary_interval: 500
+validation_interval: 1000
+best_models_num: 5
+scheduler_step_interval: 1447
+
+loss:
+  magnitude: 0.9
+  phase: 0.3
+  complex: 0.1
+  consistency: 0.05
+  metric: 0.05
+
+lr: 5e-4
+lr_decay: 0.99
+optim: adamW
+betas: [0.8, 0.99]
+max_grad_norm: 5.0
+
+device: cuda
+num_workers: 5
+
+continue_from:
+log_dir: tensorbd
+
+seed: 2039
+
+hydra:
+  run:
+    dir: ./results/experiments/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: true
+  job_logging:
+    handlers:
+      file:
+        class: logging.FileHandler
+        mode: w
+        formatter: colorlog
+        filename: trainer.log
+      console:
+        class: logging.StreamHandler
+        formatter: colorlog
+        stream: ext://sys.stderr

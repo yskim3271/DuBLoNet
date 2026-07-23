@@ -52,7 +52,7 @@ def run(args):
     model = load_model(model_params, device)
 
     # Calculate and log the total number of parameters and model size
-    logger.info(f"Selected model: Backbone")
+    logger.info(f"Selected model: {model.__class__.__name__}")
     total_params = sum(p.numel() for p in model.parameters())
     total_params_m = total_params / 1_000_000
     logger.info(f"Model's parameters: {total_params_m:.2f} M")
@@ -62,12 +62,19 @@ def run(args):
     elif args.optim == "adamW" or args.optim == "adamw":
         optim_class = torch.optim.AdamW
 
-    discriminator = MetricGAN_Discriminator().to(device)
+    generator_only = bool(args.get("generator_only", False))
+    discriminator = (
+        None if generator_only else MetricGAN_Discriminator().to(device)
+    )
 
     # optimizer
     optim = optim_class(model.parameters(), lr=args.lr, betas=args.betas)
 
-    optim_disc = optim_class(discriminator.parameters(), lr=args.lr, betas=args.betas)
+    optim_disc = (
+        None
+        if discriminator is None
+        else optim_class(discriminator.parameters(), lr=args.lr, betas=args.betas)
+    )
     
     # scheduler
     scheduler = None
@@ -75,12 +82,32 @@ def run(args):
 
     if args.lr_decay is not None:
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=args.lr_decay, last_epoch=-1)
-        scheduler_disc = torch.optim.lr_scheduler.ExponentialLR(optim_disc, gamma=args.lr_decay, last_epoch=-1)
+        if optim_disc is not None:
+            scheduler_disc = torch.optim.lr_scheduler.ExponentialLR(
+                optim_disc, gamma=args.lr_decay, last_epoch=-1
+            )
 
-    # Determine training segment size
+    sfi_config = args.model.get("sfi", {})
+    sfi_enabled = bool(sfi_config.get("enabled", False))
+    reference_sample_rate = int(
+        sfi_config.get("reference_sample_rate", args.sampling_rate)
+    )
+
+    # Determine training segment size.  SFI uses physical seconds so the same
+    # duration is preserved after selecting a target sampling rate.
     from src.receptive_field import compute_receptive_field, rf_to_segment
     raw_segment = args.dset.get("segment", 64000)
-    if raw_segment == "auto":
+    segment_seconds = args.dset.get("segment_seconds", None) if sfi_enabled else None
+    if segment_seconds is not None:
+        segment_seconds = float(segment_seconds)
+        segment = round(segment_seconds * reference_sample_rate)
+        logger.info(
+            "SFI segment: %.3f s -> %d samples at reference rate %d Hz",
+            segment_seconds,
+            segment,
+            reference_sample_rate,
+        )
+    elif raw_segment == "auto":
         segment = rf_to_segment(args.model, sampling_rate=args.sampling_rate)
         rf = compute_receptive_field(args.model, sampling_rate=args.sampling_rate)
         logger.info(f"Auto segment from RF: {rf.total_rf_frames} frames = "
@@ -100,7 +127,13 @@ def run(args):
     trainset = _vb_dataset["train"]
     testset = _vb_dataset["test"]
 
-    tr_dataset = VoiceBankDataset(trainset, segment=segment)
+    tr_dataset = VoiceBankDataset(
+        trainset,
+        segment=None if segment_seconds is not None else segment,
+        segment_seconds=segment_seconds,
+        sampling_rate=reference_sample_rate,
+        return_sample_rate=sfi_enabled,
+    )
     tr_loader = DataLoader(
         dataset=tr_dataset,
         batch_size=args.batch_size,
@@ -109,7 +142,12 @@ def run(args):
         pin_memory=True
     )
 
-    va_dataset = VoiceBankDataset(testset, segment=None)
+    va_dataset = VoiceBankDataset(
+        testset,
+        segment=None,
+        sampling_rate=reference_sample_rate,
+        return_sample_rate=sfi_enabled,
+    )
     va_loader = DataLoader(
         dataset=va_dataset,
         batch_size=1,

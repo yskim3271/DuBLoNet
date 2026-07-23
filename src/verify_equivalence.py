@@ -29,7 +29,7 @@ from src.data import VoiceBankDataset
 from src.stft import mag_pha_stft
 from src.utils import load_model, load_checkpoint, get_stft_args_from_config
 from src.models.streaming.lacosenet import LaCoSENet
-from src.batch_evaluate import compute_streaming_lookahead
+from src.batch_evaluate import compute_streaming_lookahead, get_config_latency_ids
 
 # ── Experiment registry ──────────────────────────────────────────────────
 EXPERIMENTS = {
@@ -58,11 +58,14 @@ def load_single_utterance():
     return noisy.unsqueeze(0), utt_id  # [1, 1, T]
 
 
-def fullseq_forward(model, noisy_com, device):
+def fullseq_forward(model, noisy_com, device, latency_id=None):
     """Full-sequence model forward → (est_mag, est_pha)."""
     model.eval()
     with torch.no_grad():
-        est_mag, est_pha, _ = model(noisy_com.to(device))
+        if latency_id is not None:
+            est_mag, est_pha, _ = model(noisy_com.to(device), latency_id=latency_id)
+        else:
+            est_mag, est_pha, _ = model(noisy_com.to(device))
     return est_mag, est_pha
 
 
@@ -91,12 +94,13 @@ def streaming_forward(streaming_model, noisy_com, chunk_size, enc_la):
     return torch.cat(all_mag, dim=2), torch.cat(all_pha, dim=2)
 
 
-def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
-    """Verify equivalence for a single experiment."""
-    exp_seed_dir = Path(exp_dir) / SEED
+def verify_checkpoint(exp_name, exp_seed_dir, noisy, device, chunk_size=1, latency_id=None, chkpt_file=None):
+    """Verify equivalence for a single checkpoint directory."""
+    exp_seed_dir = Path(exp_seed_dir)
     conf = OmegaConf.load(exp_seed_dir / ".hydra" / "config.yaml")
     stft_args = get_stft_args_from_config(conf.model)
-    chkpt_file = resolve_best_checkpoint(exp_seed_dir)
+    if chkpt_file is None or chkpt_file == "auto":
+        chkpt_file = resolve_best_checkpoint(exp_seed_dir)
 
     # ── Compute shared spectrogram (training STFT) ──
     noisy_com = mag_pha_stft(noisy, **stft_args)[2].to(device)  # [1, F, T, 2]
@@ -105,7 +109,7 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
     # ── Full-sequence model ──
     model = load_model(conf.model, device)
     model = load_checkpoint(model, str(exp_seed_dir), chkpt_file, device)
-    mag_full, pha_full = fullseq_forward(model, noisy_com, device)
+    mag_full, pha_full = fullseq_forward(model, noisy_com, device, latency_id=latency_id)
     mag_full = mag_full.cpu()
     pha_full = pha_full.cpu()
     del model
@@ -113,7 +117,7 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
         torch.cuda.empty_cache()
 
     # ── Streaming model ──
-    la_info = compute_streaming_lookahead(conf, chunk_size)
+    la_info = compute_streaming_lookahead(conf, chunk_size, latency_id=latency_id)
     enc_la = la_info["encoder_lookahead"]
     dec_la = la_info["decoder_lookahead"]
     total_la = la_info["total_lookahead"]
@@ -124,6 +128,7 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
         chunk_size=chunk_size,
         encoder_lookahead=enc_la,
         decoder_lookahead=dec_la,
+        latency_id=latency_id,
         fold_bn=False,
         device=device,
         verbose=False,
@@ -160,6 +165,7 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
 
     return {
         "exp_name": exp_name,
+        "latency_id": latency_id,
         "latency_ms": la_info["latency_ms"],
         "enc_la": enc_la,
         "dec_la": dec_la,
@@ -172,10 +178,22 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
     }
 
 
+def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
+    """Verify equivalence for a single legacy registry experiment."""
+    exp_seed_dir = Path(exp_dir) / SEED
+    return verify_checkpoint(exp_name, exp_seed_dir, noisy, device, chunk_size=chunk_size)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify full-seq vs streaming equivalence")
     parser.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--chunk_size", type=int, default=1, help="Streaming chunk size")
+    parser.add_argument("--chkpt_dir", type=str, default=None,
+                        help="Checkpoint directory containing .hydra/config.yaml. If omitted, uses the built-in registry.")
+    parser.add_argument("--chkpt_file", type=str, default="auto",
+                        help="Checkpoint filename, or 'auto' to use states.th best model.")
+    parser.add_argument("--latency_ids", type=str, nargs="+", default=None,
+                        help="Latency ids for latency-expert checkpoints (default: all configured ids).")
     args = parser.parse_args()
 
     print("Loading test utterance...")
@@ -188,18 +206,40 @@ def main():
           f"{'Pha MaxErr':>11} {'Pha MeanErr':>12}")
     print("-" * 100)
 
-    for exp_name, exp_dir in EXPERIMENTS.items():
-        seed_dir = Path(exp_dir) / SEED
+    if args.chkpt_dir:
+        conf = OmegaConf.load(Path(args.chkpt_dir) / ".hydra" / "config.yaml")
+        jobs = [
+            (Path(args.chkpt_dir).name, Path(args.chkpt_dir), latency_id)
+            for latency_id in get_config_latency_ids(conf, args.latency_ids)
+        ]
+    else:
+        jobs = []
+        for exp_name, exp_dir in EXPERIMENTS.items():
+            seed_dir = Path(exp_dir) / SEED
+            jobs.append((exp_name, seed_dir, None))
+
+    for exp_name, seed_dir, latency_id in jobs:
         if not seed_dir.exists():
             print(f"{exp_name:<18} SKIPPED (directory not found)")
             continue
 
-        result = verify_one(exp_name, exp_dir, noisy, args.device, args.chunk_size)
+        result = verify_checkpoint(
+            exp_name,
+            seed_dir,
+            noisy,
+            args.device,
+            args.chunk_size,
+            latency_id=latency_id,
+            chkpt_file=args.chkpt_file,
+        )
         if "error" in result:
             print(f"{exp_name:<18} ERROR: {result['error']}")
             continue
 
-        print(f"{result['exp_name']:<18} {result['latency_ms']:>5.1f}ms "
+        label = result["exp_name"]
+        if result.get("latency_id"):
+            label = f"{label}_{result['latency_id']}"
+        print(f"{label:<18} {result['latency_ms']:>5.1f}ms "
               f"{result['enc_la']:>3} {result['dec_la']:>3} "
               f"{result['T_compared']:>5} "
               f"{result['mag_max_err']:>11.2e} {result['mag_mean_err']:>12.2e} "

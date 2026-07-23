@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - latency_expert_dsddb_bn
+  - _self_
+
+model:
+  latency_expert:
+    expert_scope: dsddb_only

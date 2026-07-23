@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - latency_expert_dsddb_bn
+  - _self_
+
+model:
+  latency_expert:
+    topology: encoder_decoder
+    expert_scope: full

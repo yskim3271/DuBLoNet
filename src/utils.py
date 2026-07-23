@@ -208,11 +208,32 @@ def load_model(model_params: Dict[str, Any], device: str = 'cuda'):
     Example:
         >>> model = load_model(params, "cuda")
     """
-    from src.models.backbone import Backbone
+    from omegaconf import OmegaConf
     import inspect
-    valid_keys = inspect.signature(Backbone.__init__).parameters
-    filtered = {k: v for k, v in model_params.items() if k in valid_keys}
-    model = Backbone(**filtered)
+
+    if not isinstance(model_params, dict):
+        model_params = OmegaConf.to_container(model_params, resolve=True)
+
+    model_type = model_params.get("type", "backbone")
+
+    if model_type == "backbone":
+        from src.models.backbone import Backbone
+        model_cls = Backbone
+    elif model_type == "latency_expert_backbone":
+        from src.models.latency_expert import LatencyExpertBackbone
+        model_cls = LatencyExpertBackbone
+    else:
+        raise ValueError(
+            f"Unknown model.type '{model_type}'. "
+            "Expected 'backbone' or 'latency_expert_backbone'."
+        )
+
+    valid_keys = inspect.signature(model_cls.__init__).parameters
+    filtered = {
+        k: v for k, v in model_params.items()
+        if k in valid_keys and k != "type"
+    }
+    model = model_cls(**filtered)
     return model.to(device)
 
 
@@ -321,7 +342,7 @@ def parse_file_list(directory: str, list_file: str) -> List[str]:
         return [os.path.join(directory, line.strip()) for line in f]
 
 
-def get_stft_args_from_config(model_args) -> Dict[str, Any]:
+def get_stft_args_from_config(model_args, sample_rate: Optional[int] = None) -> Dict[str, Any]:
     """
     Extract STFT arguments from model configuration.
 
@@ -335,6 +356,20 @@ def get_stft_args_from_config(model_args) -> Dict[str, Any]:
         >>> stft_args = get_stft_args_from_config(config.model)
         >>> # Returns: {"n_fft": 400, "hop_size": 100, "win_size": 400, "compress_factor": 0.3}
     """
+    sfi_config = model_args.get("sfi", {})
+    if sfi_config and sfi_config.get("enabled", False):
+        from src.v2_contract import sfi_profile_from_config
+
+        active_sample_rate = int(
+            sample_rate
+            if sample_rate is not None
+            else sfi_config.get("reference_sample_rate", 16000)
+        )
+        profile = sfi_profile_from_config(sfi_config, active_sample_rate)
+        return profile.as_stft_args(
+            compress_factor=model_args.get("compress_factor", 1.0)
+        )
+
     fft_len = model_args.fft_len
     return {
         "n_fft": fft_len,
@@ -380,6 +415,18 @@ def compute_lookahead_from_config(model_config) -> Tuple[int, int]:
     Returns:
         (encoder_lookahead, decoder_lookahead) in frames
     """
+    latency_config = model_config.get("latency_expert", {})
+    future_frames = latency_config.get("future_frames") if latency_config else None
+    if future_frames is not None:
+        latency_ids = list(latency_config.get("latency_ids", future_frames.keys()))
+        latency_id = latency_config.get("default_latency_id", latency_ids[0])
+        topology = latency_config.get("topology", "decoder_only")
+        if topology != "decoder_only":
+            raise ValueError(
+                "Explicit v2 future_frames currently supports decoder_only topology"
+            )
+        return 0, int(future_frames[latency_id])
+
     depth = getattr(model_config, 'dense_depth', 4)
     enc_ratio = list(getattr(model_config, 'encoder_padding_ratio', [0.5, 0.5]))
     dec_ratio = list(getattr(model_config, 'decoder_padding_ratio', [0.5, 0.5]))

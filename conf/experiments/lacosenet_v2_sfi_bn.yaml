@@ -1,0 +1,52 @@
+# @package _global_
+defaults:
+  - latency_expert_dsddb_bn
+  - _self_
+
+# LaCoSENet v2 locked operating grid.  win/hop/fft below are the 16 kHz
+# reference values; the active values are derived from model.sfi and the
+# selected sample rate at every step.
+dset:
+  segment_seconds: 1.0
+
+model:
+  type: latency_expert_backbone
+  win_len: 640
+  hop_len: 320
+  fft_len: 640
+  causal_ts_block: true
+  encoder_padding_ratio: [1.0, 0.0]
+  decoder_padding_ratio: [1.0, 0.0]
+  norm_type: batch
+  sfi:
+    enabled: true
+    reference_sample_rate: 16000
+    target_sample_rates: [8000, 16000, 22050, 24000, 32000, 44100, 48000]
+    window_ms: 40.0
+    hop_ms: 20.0
+    fixed_mask_gate: true
+    pad_even_frequency: true
+  latency_expert:
+    latency_ids: [LA0, LA1, LA2, LA3]
+    default_latency_id: LA1
+    topology: decoder_only
+    expert_scope: dsddb_bn
+    latency_sampling: balanced_grid
+    future_frames:
+      LA0: 0
+      LA1: 1
+      LA2: 2
+      LA3: 3
+    # Derived and validated by src.v2_contract at model construction time.
+    encoder_padding_ratios: null
+    decoder_padding_ratios: null
+
+target_sample_rates: [8000, 16000, 22050, 24000, 32000, 44100, 48000]
+sampling_rate: 16000
+validation_sample_rate: 16000
+
+# Multi-rate MetricGAN/PESQ remains disabled until a rate-aware objective is
+# connected.  Magnitude/phase/complex/consistency losses remain active.
+generator_only: true
+loss:
+  metric: 0.0

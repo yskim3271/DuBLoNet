@@ -1,6 +1,7 @@
 import os
 import time
 import shutil
+import random
 import torch
 import torch.nn.functional as F
 
@@ -8,6 +9,11 @@ from torch.utils.tensorboard import SummaryWriter
 from .stft import mag_pha_istft, mag_pha_stft
 from .utils import copy_state, batch_pesq, anti_wrapping_function, \
                   phase_losses, get_stft_args_from_config
+from .v2_contract import (
+    BalancedOperatingPointSchedule,
+    LATENCY_FUTURE_FRAMES,
+    TARGET_SAMPLE_RATES,
+)
 
 
 class Solver(object):
@@ -65,7 +71,70 @@ class Solver(object):
         self.num_workers = args.num_workers
         self.args = args
 
+        sfi_config = args.model.get("sfi", {})
+        self.sfi_enabled = bool(sfi_config.get("enabled", False))
+        self.reference_sample_rate = int(
+            sfi_config.get("reference_sample_rate", args.sampling_rate)
+        )
+        self.validation_sample_rate = int(
+            args.get("validation_sample_rate", self.reference_sample_rate)
+        )
+        self.generator_only = bool(args.get("generator_only", False))
+        self.operating_schedule = None
+        if not self.generator_only and (
+            self.discriminator is None or self.optim_disc is None
+        ):
+            raise ValueError(
+                "MetricGAN training requires discriminator and optimizer_disc"
+            )
+
         self.step_start = 0
+        self.is_latency_expert = hasattr(self.model, "get_latency_ids")
+        self.latency_ids = self.model.get_latency_ids() if self.is_latency_expert else []
+        self.latency_sampling = "uniform"
+        if self.is_latency_expert:
+            latency_expert_cfg = getattr(args.model, "latency_expert", {})
+            if hasattr(latency_expert_cfg, "get"):
+                self.latency_sampling = latency_expert_cfg.get("latency_sampling", "uniform")
+            if self.latency_sampling not in {"uniform", "balanced_grid"}:
+                raise ValueError(
+                    f"Unsupported latency_sampling: {self.latency_sampling}. "
+                    "Expected 'uniform' or 'balanced_grid'."
+                )
+            self.logger.info(
+                "Latency expert training enabled | ids=%s | sampling=%s",
+                self.latency_ids,
+                self.latency_sampling,
+            )
+
+        if self.sfi_enabled:
+            if not self.is_latency_expert:
+                raise ValueError("v2 SFI training requires a latency-expert model")
+            latency_config = args.model.get("latency_expert", {})
+            future_frames = latency_config.get(
+                "future_frames", LATENCY_FUTURE_FRAMES
+            )
+            target_sample_rates = args.get(
+                "target_sample_rates",
+                sfi_config.get("target_sample_rates", TARGET_SAMPLE_RATES),
+            )
+            if self.latency_sampling != "balanced_grid":
+                raise ValueError(
+                    "v2 SFI training requires latency_sampling='balanced_grid'"
+                )
+            self.operating_schedule = BalancedOperatingPointSchedule(
+                sample_rates=list(target_sample_rates),
+                future_frames=dict(future_frames),
+                seed=int(args.seed),
+            )
+            self.logger.info(
+                "SFI operating grid enabled | rates=%s | latency=%s | "
+                "cycle=%d | generator_only=%s",
+                list(self.operating_schedule.sample_rates),
+                self.operating_schedule.future_frames,
+                self.operating_schedule.cycle_size,
+                self.generator_only,
+            )
 
         # Initialize or resume (checkpoint loading)
         self._reset()
@@ -85,13 +154,17 @@ class Solver(object):
         package = {}
         package['model'] = copy_state(self.model.state_dict())
         package['best_models'] = self.best_models
-        package['discriminator'] = copy_state(self.discriminator.state_dict())
+        if self.discriminator is not None:
+            package['discriminator'] = copy_state(self.discriminator.state_dict())
         package['optimizer'] = self.optim.state_dict()
-        package['optimizer_disc'] = self.optim_disc.state_dict()
+        if self.optim_disc is not None:
+            package['optimizer_disc'] = self.optim_disc.state_dict()
         package['scheduler'] = self.scheduler.state_dict() if self.scheduler is not None else None
         package['scheduler_disc'] = self.scheduler_disc.state_dict() if self.scheduler_disc is not None else None
         package['args'] = self.args
         package['step'] = step
+        if self.operating_schedule is not None:
+            package['operating_schedule'] = self.operating_schedule.state_dict()
         # Write to a temporary file first
         tmp_path = "states.tmp"
         save_path = "states.th"
@@ -142,19 +215,33 @@ class Solver(object):
 
             model_state = package['model']
             model_disc_state = package.get('discriminator', None)
-            optim_state = package['optimizer']
+            optim_state = package.get('optimizer', None)
             optim_disc_state = package.get('optimizer_disc', None)
             scheduler_state = package.get('scheduler', None)
             scheduler_disc_state = package.get('scheduler_disc', None)
             self.best_models = package.get('best_models', [])
-            self.step_start = package.get('step', 0)
+            self.step_start = package.get('step', 0) if optim_state is not None else 0
+
+            schedule_state = package.get('operating_schedule')
+            if schedule_state is not None:
+                if self.operating_schedule is None:
+                    raise ValueError(
+                        "Checkpoint contains an operating schedule but the current config does not"
+                    )
+                self.operating_schedule.load_state_dict(schedule_state)
 
             self.model.load_state_dict(model_state)
-            self.optim.load_state_dict(optim_state)
+            if optim_state is not None:
+                self.optim.load_state_dict(optim_state)
+            else:
+                self.logger.warning(
+                    "Checkpoint has no optimizer state; loaded model weights only "
+                    "and will start optimizer/scheduler from scratch."
+                )
 
-            if model_disc_state is not None:
+            if model_disc_state is not None and self.discriminator is not None:
                 self.discriminator.load_state_dict(model_disc_state)
-            if optim_disc_state is not None:
+            if optim_disc_state is not None and self.optim_disc is not None:
                 self.optim_disc.load_state_dict(optim_disc_state)
 
             if self.scheduler is not None and scheduler_state is not None:
@@ -186,7 +273,18 @@ class Solver(object):
 
             data = next(loader_iter)
             noisy, clean = data[0], data[1]
-            loss_dict = self._run_one_step(noisy, clean)
+            source_sample_rate = data[2] if self.sfi_enabled else None
+            operating_point = (
+                self.operating_schedule.next()
+                if self.operating_schedule is not None
+                else None
+            )
+            loss_dict = self._run_one_step(
+                noisy,
+                clean,
+                source_sample_rate=source_sample_rate,
+                operating_point=operating_point,
+            )
 
             if step % self.log_interval == 0:
                 lr = self.optim.param_groups[0]['lr']
@@ -218,47 +316,121 @@ class Solver(object):
         self.logger.info("-" * 70)
         self.writer.close()
 
-    def _run_one_step(self, noisy, clean):
+    @staticmethod
+    def _batch_sample_rate(value):
+        """Return one integer rate and reject mixed-rate tensor batches."""
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            rates = {int(item) for item in value.detach().cpu().reshape(-1).tolist()}
+        elif isinstance(value, (list, tuple)):
+            rates = {int(item) for item in value}
+        else:
+            rates = {int(value)}
+        if len(rates) != 1:
+            raise ValueError(f"A training batch must contain one sample rate: {rates}")
+        return rates.pop()
+
+    @staticmethod
+    def _resample_pair(noisy, clean, source_sample_rate, target_sample_rate):
+        if source_sample_rate == target_sample_rate:
+            return noisy, clean
+        from torchaudio.functional import resample
+
+        noisy = resample(noisy, source_sample_rate, target_sample_rate)
+        clean = resample(clean, source_sample_rate, target_sample_rate)
+        common_length = min(noisy.shape[-1], clean.shape[-1])
+        return noisy[..., :common_length], clean[..., :common_length]
+
+    def _run_one_step(
+        self,
+        noisy,
+        clean,
+        source_sample_rate=None,
+        operating_point=None,
+    ):
 
         self.model.train()
-        self.discriminator.train()
+        if not self.generator_only:
+            self.discriminator.train()
 
         noisy = noisy.to(self.device)
         clean = clean.to(self.device)
-        one_labels = torch.ones(noisy.shape[0]).to(self.device)
 
-        noisy_com = mag_pha_stft(noisy, **self.stft_args)[2]
-        clean_mag, clean_pha, clean_com = mag_pha_stft(clean, **self.stft_args)
-
-        clean_mag_hat, clean_pha_hat, clean_com_hat = self.model(noisy_com)
-
-        clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **self.stft_args)
-        clean_mag_hat_con, clean_pha_hat_con, clean_com_hat_con = mag_pha_stft(clean_hat, **self.stft_args)
-
-        # Discriminator training
-        clean_list, clean_list_hat = list(clean.cpu().numpy()), list(clean_hat.detach().cpu().numpy())
-        batch_pesq_score = batch_pesq(clean_list, clean_list_hat, workers=self.num_workers)
-
-        self.optim_disc.zero_grad()
-
-        metric_r = self.discriminator(clean_mag.unsqueeze(1), clean_mag.unsqueeze(1))
-        metric_g = self.discriminator(clean_mag.unsqueeze(1), clean_mag_hat_con.detach().unsqueeze(1))
-
-        loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
-
-        if batch_pesq_score is not None:
-            loss_disc_g = F.mse_loss(batch_pesq_score.to(self.device), metric_g.flatten())
+        if operating_point is not None:
+            source_rate = self._batch_sample_rate(source_sample_rate)
+            if source_rate is None:
+                raise ValueError("SFI batches must provide the source sampling rate")
+            sample_rate = operating_point.sample_rate
+            latency_id = operating_point.latency_id
+            noisy, clean = self._resample_pair(
+                noisy, clean, source_rate, sample_rate
+            )
+            stft_args = get_stft_args_from_config(
+                self.args.model, sample_rate=sample_rate
+            )
         else:
-            loss_disc_g = 0
+            sample_rate = self.reference_sample_rate
+            latency_id = self._sample_latency_id()
+            stft_args = self.stft_args
 
-        loss_disc = loss_disc_r + loss_disc_g
+        noisy_com = mag_pha_stft(noisy, **stft_args)[2]
+        clean_mag, clean_pha, clean_com = mag_pha_stft(clean, **stft_args)
 
-        loss_disc.backward()
+        clean_mag_hat, clean_pha_hat, clean_com_hat = self._forward_model(
+            noisy_com, latency_id=latency_id
+        )
 
-        max_grad_norm = getattr(self.args, 'max_grad_norm', 5.0)
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=max_grad_norm)
+        clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **stft_args)
+        clean_mag_hat_con, clean_pha_hat_con, clean_com_hat_con = mag_pha_stft(
+            clean_hat, **stft_args
+        )
 
-        self.optim_disc.step()
+        if not self.generator_only:
+            if sample_rate != 16000:
+                raise ValueError(
+                    "The current MetricGAN/PESQ objective is valid only at 16 kHz. "
+                    "Use generator_only=true for the v2 multi-rate pilot."
+                )
+            one_labels = torch.ones(noisy.shape[0]).to(self.device)
+
+            # Discriminator training
+            clean_list = list(clean.cpu().numpy())
+            clean_list_hat = list(clean_hat.detach().cpu().numpy())
+            batch_pesq_score = batch_pesq(
+                clean_list, clean_list_hat, workers=self.num_workers
+            )
+
+            self.optim_disc.zero_grad()
+
+            metric_r = self.discriminator(
+                clean_mag.unsqueeze(1), clean_mag.unsqueeze(1)
+            )
+            metric_g = self.discriminator(
+                clean_mag.unsqueeze(1), clean_mag_hat_con.detach().unsqueeze(1)
+            )
+
+            loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
+
+            if batch_pesq_score is not None:
+                loss_disc_g = F.mse_loss(
+                    batch_pesq_score.to(self.device), metric_g.flatten()
+                )
+            else:
+                loss_disc_g = 0
+
+            loss_disc = loss_disc_r + loss_disc_g
+            loss_disc.backward()
+
+            max_grad_norm = getattr(self.args, 'max_grad_norm', 5.0)
+            torch.nn.utils.clip_grad_norm_(
+                self.discriminator.parameters(), max_norm=max_grad_norm
+            )
+
+            self.optim_disc.step()
+        else:
+            loss_disc = clean_mag_hat.new_zeros(())
+            max_grad_norm = getattr(self.args, 'max_grad_norm', 5.0)
 
         # Generator training
         self.optim.zero_grad()
@@ -268,8 +440,13 @@ class Solver(object):
         loss_complex = F.mse_loss(clean_com, clean_com_hat) * 2
         loss_consistency = F.mse_loss(clean_com_hat, clean_com_hat_con) * 2
 
-        metric_g = self.discriminator(clean_mag.unsqueeze(1), clean_mag_hat_con.unsqueeze(1))
-        loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
+        if self.generator_only:
+            loss_metric = clean_mag_hat.new_zeros(())
+        else:
+            metric_g = self.discriminator(
+                clean_mag.unsqueeze(1), clean_mag_hat_con.unsqueeze(1)
+            )
+            loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
 
         loss_gen = loss_metric * self.loss.metric + \
                    loss_complex * self.loss.complex + \
@@ -295,63 +472,131 @@ class Solver(object):
 
         return loss_dict
 
+    def _sample_latency_id(self):
+        if not self.is_latency_expert:
+            return None
+        return random.choice(self.latency_ids)
+
+    def _forward_model(self, noisy_com, latency_id=None):
+        if self.is_latency_expert:
+            return self.model(noisy_com, latency_id=latency_id)
+        return self.model(noisy_com)
 
     def _run_validation(self, steps):
         self.model.eval()
-        self.discriminator.eval()
+        if not self.generator_only:
+            self.discriminator.eval()
 
-        val_err_complex = 0
-        val_err_mag = 0
-        val_err_phase = 0
-        clean_list, clean_hat_list = [], []
-
-        with torch.no_grad():
-            for data in self.va_loader:
-                noisy, clean = data[0], data[1]
-                noisy = noisy.squeeze(0).to(self.device)
-                clean = clean.squeeze(0).to(self.device)
-
-                # Full-length inference (no segmentation)
-                noisy_in = noisy.unsqueeze(0)   # [1, length]
-                clean_in = clean.unsqueeze(0)    # [1, length]
-
-                noisy_com = mag_pha_stft(noisy_in, **self.stft_args)[2]
-                clean_mag, clean_pha, clean_com = mag_pha_stft(clean_in, **self.stft_args)
-
-                clean_mag_hat, clean_pha_hat, clean_com_hat = self.model(noisy_com)
-
-                clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **self.stft_args)
-
-                # Align lengths (defensive)
-                min_len = min(clean.shape[-1], clean_hat.shape[-1])
-                clean = clean[..., :min_len]
-                clean_hat = clean_hat[..., :min_len]
-
-                clean_list.append(clean.squeeze().detach().cpu().numpy())
-                clean_hat_list.append(clean_hat.squeeze().detach().cpu().numpy())
-
-                val_err_complex += F.l1_loss(clean_com, clean_com_hat).item()
-                val_err_mag += F.l1_loss(clean_mag, clean_mag_hat).item()
-                val_err_phase += torch.mean(anti_wrapping_function(clean_pha - clean_pha_hat)).item()
-
-
-        val_err_complex /= len(self.va_loader)
-        val_err_mag /= len(self.va_loader)
-        val_err_phase /= len(self.va_loader)
-        val_pesq_result = batch_pesq(clean_list, clean_hat_list, workers=self.num_workers, normalize=False)
-        if val_pesq_result is not None:
-            val_pesq_score = val_pesq_result.mean().item()
-        else:
-            val_pesq_score = 0
-
-        self.logger.info("-" * 70)
-        self.logger.info(
-            f"Validation | Step {steps} | Complex Diff {val_err_complex:.5f} | Magnitude Diff {val_err_mag:.5f} | Phase Diff {val_err_phase:.5f} | Valid PESQ {val_pesq_score:.5f}"
+        if self.validation_sample_rate != 16000:
+            raise ValueError(
+                "The current checkpoint-selection PESQ path is 16 kHz only; "
+                "set validation_sample_rate=16000 until the URGENT evaluator is connected."
+            )
+        validation_stft_args = get_stft_args_from_config(
+            self.args.model,
+            sample_rate=self.validation_sample_rate if self.sfi_enabled else None,
         )
-        self.logger.info("-" * 70)
-        self.writer.add_scalar("Validation/Complex_Loss", val_err_complex, steps)
-        self.writer.add_scalar("Validation/Magnitude_Loss", val_err_mag, steps)
-        self.writer.add_scalar("Validation/Phase_Loss", val_err_phase, steps)
-        self.writer.add_scalar("Validation/Validation_PESQ_Score", val_pesq_score, steps)
 
-        return val_pesq_score
+        latency_ids = self.latency_ids if self.is_latency_expert else [None]
+        validation_results = {}
+
+        for latency_id in latency_ids:
+            tag = latency_id or "default"
+            val_err_complex = 0
+            val_err_mag = 0
+            val_err_phase = 0
+            clean_list, clean_hat_list = [], []
+
+            with torch.no_grad():
+                for data in self.va_loader:
+                    noisy, clean = data[0], data[1]
+                    source_sample_rate = data[2] if self.sfi_enabled else None
+                    noisy = noisy.squeeze(0).to(self.device)
+                    clean = clean.squeeze(0).to(self.device)
+
+                    # Full-length inference (no segmentation)
+                    noisy_in = noisy.unsqueeze(0)   # [1, length]
+                    clean_in = clean.unsqueeze(0)    # [1, length]
+
+                    if self.sfi_enabled:
+                        source_rate = self._batch_sample_rate(source_sample_rate)
+                        noisy_in, clean_in = self._resample_pair(
+                            noisy_in,
+                            clean_in,
+                            source_rate,
+                            self.validation_sample_rate,
+                        )
+                        clean = clean_in.squeeze(0)
+
+                    noisy_com = mag_pha_stft(noisy_in, **validation_stft_args)[2]
+                    clean_mag, clean_pha, clean_com = mag_pha_stft(
+                        clean_in, **validation_stft_args
+                    )
+
+                    clean_mag_hat, clean_pha_hat, clean_com_hat = self._forward_model(
+                        noisy_com, latency_id=latency_id
+                    )
+
+                    clean_hat = mag_pha_istft(
+                        clean_mag_hat, clean_pha_hat, **validation_stft_args
+                    )
+
+                    # Align lengths (defensive)
+                    min_len = min(clean.shape[-1], clean_hat.shape[-1])
+                    clean = clean[..., :min_len]
+                    clean_hat = clean_hat[..., :min_len]
+
+                    clean_list.append(clean.squeeze().detach().cpu().numpy())
+                    clean_hat_list.append(clean_hat.squeeze().detach().cpu().numpy())
+
+                    val_err_complex += F.l1_loss(clean_com, clean_com_hat).item()
+                    val_err_mag += F.l1_loss(clean_mag, clean_mag_hat).item()
+                    val_err_phase += torch.mean(anti_wrapping_function(clean_pha - clean_pha_hat)).item()
+
+            val_err_complex /= len(self.va_loader)
+            val_err_mag /= len(self.va_loader)
+            val_err_phase /= len(self.va_loader)
+            val_pesq_result = batch_pesq(
+                clean_list, clean_hat_list, workers=self.num_workers, normalize=False
+            )
+            if val_pesq_result is not None:
+                val_pesq_score = val_pesq_result.mean().item()
+            else:
+                val_pesq_score = 0
+
+            validation_results[tag] = {
+                "complex": val_err_complex,
+                "magnitude": val_err_mag,
+                "phase": val_err_phase,
+                "pesq": val_pesq_score,
+            }
+
+        pesq_scores = [v["pesq"] for v in validation_results.values()]
+        val_pesq_mean = sum(pesq_scores) / len(pesq_scores)
+        val_pesq_min = min(pesq_scores)
+
+        self.logger.info("-" * 70)
+        for tag, result in validation_results.items():
+            self.logger.info(
+                f"Validation | Step {steps} | {tag} | "
+                f"Complex Diff {result['complex']:.5f} | "
+                f"Magnitude Diff {result['magnitude']:.5f} | "
+                f"Phase Diff {result['phase']:.5f} | "
+                f"Valid PESQ {result['pesq']:.5f}"
+            )
+            prefix = f"Validation/{tag}" if self.is_latency_expert else "Validation"
+            self.writer.add_scalar(f"{prefix}/Complex_Loss", result["complex"], steps)
+            self.writer.add_scalar(f"{prefix}/Magnitude_Loss", result["magnitude"], steps)
+            self.writer.add_scalar(f"{prefix}/Phase_Loss", result["phase"], steps)
+            self.writer.add_scalar(f"{prefix}/Validation_PESQ_Score", result["pesq"], steps)
+
+        if self.is_latency_expert:
+            self.logger.info(
+                f"Validation | Step {steps} | valid_pesq_mean {val_pesq_mean:.5f} | "
+                f"valid_pesq_min {val_pesq_min:.5f}"
+            )
+            self.writer.add_scalar("Validation/valid_pesq_mean", val_pesq_mean, steps)
+            self.writer.add_scalar("Validation/valid_pesq_min", val_pesq_min, steps)
+        self.logger.info("-" * 70)
+
+        return val_pesq_mean

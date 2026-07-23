@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - latency_expert_dsddb_bn
+  - _self_
+
+model:
+  encoder_padding_ratio: [1.00, 0.00]
+  decoder_padding_ratio: [0.80, 0.20]
+  latency_expert:
+    topology: decoder_only
+    expert_scope: dsddb_bn
+    encoder_padding_ratios:
+      L0: [1.00, 0.00]
+      L1: [1.00, 0.00]
+      L3: [1.00, 0.00]
+      L5: [1.00, 0.00]
+    decoder_padding_ratios:
+      L0: [1.00, 0.00]
+      L1: [0.92, 0.08]
+      L3: [0.80, 0.20]
+      L5: [0.68, 0.32]

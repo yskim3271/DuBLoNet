@@ -47,41 +47,67 @@ def segment_sample(noisy, clean, segment):
 
 
 class VoiceBankDataset(torch.utils.data.Dataset):
-    def __init__(self, datapair_list, segment=None, with_id=False, with_text=False):
+    def __init__(
+        self,
+        datapair_list,
+        segment=None,
+        with_id=False,
+        with_text=False,
+        sampling_rate=16000,
+        return_sample_rate=False,
+        segment_seconds=None,
+    ):
         self.segment = segment
+        self.segment_seconds = segment_seconds
         self.with_id = with_id
         self.with_text = with_text
-        self.sampling_rate = 16000
+        self.sampling_rate = int(sampling_rate)
+        self.return_sample_rate = return_sample_rate
         self.audio_pairs = []
 
         for item in datapair_list:
             id = item["id"]
-            noisy = item["noisy"]["array"].astype("float32")
-            clean = item["clean"]["array"].astype("float32")
+            noisy_item = item["noisy"]
+            clean_item = item["clean"]
+            noisy = noisy_item["array"].astype("float32")
+            clean = clean_item["array"].astype("float32")
+            noisy_sr = int(noisy_item.get("sampling_rate", self.sampling_rate))
+            clean_sr = int(clean_item.get("sampling_rate", noisy_sr))
+            if noisy_sr != clean_sr:
+                raise ValueError(
+                    f"Sampling-rate mismatch for {id}: noisy={noisy_sr}, clean={clean_sr}"
+                )
             # Power normalization
             norm_factor = np.sqrt(noisy.shape[-1] / np.sum(noisy ** 2.0))
             noisy = noisy * norm_factor
             clean = clean * norm_factor
-            self.audio_pairs.append((noisy, clean, id))
+            self.audio_pairs.append((noisy, clean, id, noisy_sr))
 
     def __len__(self):
         return len(self.audio_pairs)
 
     def __getitem__(self, index):
-        noisy, clean, id = self.audio_pairs[index]
+        noisy, clean, id, sampling_rate = self.audio_pairs[index]
 
         noisy = torch.FloatTensor(noisy)
         clean = torch.FloatTensor(clean)
 
-        if self.segment is not None:
-            noisy, clean = random_sample(noisy, clean, self.segment)
+        segment = self.segment
+        if self.segment_seconds is not None:
+            segment = round(float(self.segment_seconds) * sampling_rate)
+        if segment is not None:
+            noisy, clean = random_sample(noisy, clean, int(segment))
 
         if self.with_text:
-            return noisy, clean, id, ""
+            result = (noisy, clean, id, "")
         elif self.with_id:
-            return noisy, clean, id
+            result = (noisy, clean, id)
         else:
-            return noisy, clean
+            result = (noisy, clean)
+
+        if self.return_sample_rate:
+            result = result + (sampling_rate,)
+        return result
 
 
 class StepSampler(torch.utils.data.Sampler):

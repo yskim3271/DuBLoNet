@@ -55,6 +55,7 @@ Example (both encoder and decoder asymmetric):
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
@@ -178,6 +179,13 @@ class LaCoSENet(nn.Module):
         self.win_size = win_size
         self.compress_factor = compress_factor
         self.sample_rate = sample_rate
+        self.output_frequency_bins = self.n_fft // 2 + 1
+        self.internal_frequency_bins = (
+            self.output_frequency_bins + 1
+            if getattr(self.model, "pad_even_frequency", False)
+            and self.output_frequency_bins % 2 == 0
+            else self.output_frequency_bins
+        )
         # Streaming emulates center=True via center=False + manual context buffers
         # (win_size/2 past + win_size/2 future), adding stft_center_delay.
         self.stft_future_samples = self.win_size // 2
@@ -321,13 +329,15 @@ class LaCoSENet(nn.Module):
         chkpt_dir: str,
         chkpt_file: str = "best.th",
         chunk_size: int = 64,
-        encoder_lookahead: int = 0,
-        decoder_lookahead: int = 7,
+        encoder_lookahead: Optional[int] = None,
+        decoder_lookahead: Optional[int] = None,
         use_reshape_free: bool = False,
         fold_bn: bool = False,
         device: Optional[str] = None,
         verbose: bool = True,
         disable_state_guard: bool = False,
+        latency_id: Optional[str] = None,
+        sample_rate: Optional[int] = None,
     ) -> "LaCoSENet":
         """
         Create LaCoSENet from a checkpoint directory.
@@ -358,6 +368,10 @@ class LaCoSENet(nn.Module):
             device: Device to load model on
             verbose: Print loading information
             disable_state_guard: Disable selective state update (ablation).
+            latency_id: Latency branch to use for latency-expert checkpoints.
+                A streaming wrapper is fixed to one latency id for its lifetime.
+            sample_rate: Fixed sampling rate for this streaming instance.  SFI
+                checkpoints derive their 40/20 ms STFT sizes from this value.
 
         Returns:
             LaCoSENet instance
@@ -371,6 +385,33 @@ class LaCoSENet(nn.Module):
 
         if verbose:
             print(f"Loading LaCoSENet from: {chkpt_dir}")
+
+        config_path = os.path.join(chkpt_dir, ".hydra", "config.yaml")
+        if os.path.exists(config_path) and (use_reshape_free or fold_bn):
+            from omegaconf import OmegaConf
+
+            conf = OmegaConf.load(config_path)
+            if conf.model.get("type", "backbone") == "latency_expert_backbone":
+                unsupported = []
+                if use_reshape_free:
+                    unsupported.append("reshape-free TS_BLOCK conversion")
+                if fold_bn:
+                    unsupported.append("BN folding")
+                raise NotImplementedError(
+                    "LatencyExpertBackbone streaming does not support "
+                    + " or ".join(unsupported)
+                    + " in v1."
+                )
+
+        if latency_id is not None and use_reshape_free:
+            raise NotImplementedError(
+                "LatencyExpertBackbone streaming does not support reshape-free "
+                "TS_BLOCK conversion in v1."
+            )
+        if latency_id is not None and fold_bn:
+            raise NotImplementedError(
+                "LatencyExpertBackbone streaming does not support BN folding in v1."
+            )
 
         # Use unified model preparation pipeline
         model, metadata = prepare_streaming_model(
@@ -390,11 +431,52 @@ class LaCoSENet(nn.Module):
         rf_sequence_block = metadata.get("rf_sequence_block", None)
         rf_block_count = metadata.get("rf_block_count", 0)
 
+        is_latency_expert = getattr(model, "is_latency_expert", False)
+        if is_latency_expert:
+            if use_reshape_free:
+                raise NotImplementedError(
+                    "LatencyExpertBackbone streaming does not support reshape-free "
+                    "TS_BLOCK conversion in v1."
+                )
+            if fold_bn:
+                raise NotImplementedError(
+                    "LatencyExpertBackbone streaming does not support BN folding in v1."
+                )
+            latency_ids = model.get_latency_ids()
+            if latency_id is None:
+                latency_id = getattr(model, "default_latency_id", latency_ids[0])
+            if latency_id not in latency_ids:
+                raise ValueError(
+                    f"Unknown latency_id '{latency_id}'. Expected one of {latency_ids}."
+                )
+            model.set_latency_id(latency_id)
+
         # Get padding ratios from model config
-        enc_padding = getattr(model_params, 'encoder_padding_ratio', [1.0, 0.0])
-        dec_padding = getattr(model_params, 'decoder_padding_ratio', [1.0, 0.0])
+        if is_latency_expert:
+            ratio_info = model.get_padding_ratio(latency_id)
+            enc_padding = ratio_info["encoder_padding_ratio"]
+            dec_padding = ratio_info["decoder_padding_ratio"]
+        else:
+            enc_padding = getattr(model_params, 'encoder_padding_ratio', [1.0, 0.0])
+            dec_padding = getattr(model_params, 'decoder_padding_ratio', [1.0, 0.0])
+
+        from src.utils import compute_lookahead_frames
+
+        if encoder_lookahead is None:
+            encoder_lookahead = compute_lookahead_frames(
+                enc_padding, getattr(model, "dense_depth", 4)
+            )
+        if decoder_lookahead is None:
+            if is_latency_expert and hasattr(model, "get_future_frames"):
+                decoder_lookahead = model.get_future_frames(latency_id)
+            else:
+                decoder_lookahead = compute_lookahead_frames(
+                    dec_padding, getattr(model, "dense_depth", 4)
+                )
 
         if verbose:
+            if is_latency_expert:
+                print(f"  Latency id: {latency_id}")
             print(f"  Encoder padding ratio: {enc_padding}")
             print(f"  Decoder padding ratio: {dec_padding}")
 
@@ -408,18 +490,43 @@ class LaCoSENet(nn.Module):
                     return value
             return default
 
-        # Get STFT parameters. Training configs use hop_len/fft_len/win_len;
-        # keep the older aliases for compatibility with external checkpoints.
-        hop_size = get_model_param("hop_len", "hop_size", default=100)
-        n_fft = get_model_param("fft_len", "n_fft", default=400)
-        win_size = get_model_param("win_len", "win_size", default=400)
+        # Get STFT parameters.  A v2 SFI streaming instance is fixed to one
+        # sample rate for its entire lifetime so all state shapes stay stable.
+        sfi_config = get_model_param("sfi", default={}) or {}
+        active_sample_rate = int(
+            sample_rate
+            if sample_rate is not None
+            else sfi_config.get("reference_sample_rate", 16000)
+        )
+        if sfi_config.get("enabled", False):
+            from src.v2_contract import sfi_profile_from_config
+
+            profile = sfi_profile_from_config(sfi_config, active_sample_rate)
+            hop_size = profile.hop_len
+            n_fft = profile.fft_len
+            win_size = profile.win_len
+        else:
+            hop_size = get_model_param("hop_len", "hop_size", default=100)
+            n_fft = get_model_param("fft_len", "n_fft", default=400)
+            win_size = get_model_param("win_len", "win_size", default=400)
         compress_factor = get_model_param("compress_factor", default=0.3)
 
         # Calculate freq_size from actual encoder output (not STFT bins)
         # DenseEncoder's dense_conv_2 has stride=(1,2), halving freq dimension
         stft_freq = n_fft // 2 + 1
+        internal_stft_freq = (
+            stft_freq + 1
+            if getattr(model, "pad_even_frequency", False) and stft_freq % 2 == 0
+            else stft_freq
+        )
         with torch.no_grad():
-            dummy = torch.randn(1, 2, 4, stft_freq, device=next(model.parameters()).device)
+            dummy = torch.randn(
+                1,
+                2,
+                4,
+                internal_stft_freq,
+                device=next(model.parameters()).device,
+            )
             freq_size = model.dense_encoder(dummy).shape[3]
 
         # Create instance
@@ -432,6 +539,7 @@ class LaCoSENet(nn.Module):
             n_fft=n_fft,
             win_size=win_size,
             compress_factor=compress_factor,
+            sample_rate=active_sample_rate,
             rf_sequence_block=rf_sequence_block,
             freq_size=freq_size,
             disable_state_guard=disable_state_guard,
@@ -445,7 +553,9 @@ class LaCoSENet(nn.Module):
             "decoder_padding_ratio": dec_padding,
             "stateful_conv_count": stateful_conv_count,
             "rf_block_count": rf_block_count,
-            "model_class": "Backbone",
+            "model_class": model.__class__.__name__,
+            "latency_id": latency_id,
+            "sample_rate": active_sample_rate,
         }
 
         # The dummy forward above runs through stateful encoder layers after model
@@ -507,6 +617,17 @@ class LaCoSENet(nn.Module):
         """
         from src.models.backbone import complex_to_mag_pha
         from src.models.streaming.utils import StateFramesContext
+
+        if spectrogram.shape[1] != self.output_frequency_bins:
+            raise ValueError(
+                f"Streaming STFT produced {spectrogram.shape[1]} bins; "
+                f"expected {self.output_frequency_bins} for n_fft={self.n_fft}"
+            )
+        if self.internal_frequency_bins != self.output_frequency_bins:
+            pad = spectrogram.new_zeros(
+                spectrogram.shape[0], 1, spectrogram.shape[2], spectrogram.shape[3]
+            )
+            spectrogram = torch.cat((spectrogram, pad), dim=1)
 
         _, _, T, _ = spectrogram.shape
 
@@ -606,6 +727,10 @@ class LaCoSENet(nn.Module):
             mask = self.model.mask_decoder(features).squeeze(1).transpose(1, 2)
             est_pha = self.model.phase_decoder(features).squeeze(1).transpose(1, 2)
 
+        mask = mask[:, :self.output_frequency_bins, :]
+        est_pha = est_pha[:, :self.output_frequency_bins, :]
+        chunk_mag = chunk_mag[:, :self.output_frequency_bins, :]
+
         infer_type = getattr(self.model, 'infer_type', 'masking')
         if infer_type == 'masking':
             est_mag = chunk_mag * mask
@@ -662,6 +787,10 @@ class LaCoSENet(nn.Module):
         with StateFramesContext(None if self.disable_state_guard else self.chunk_size):
             mask = self.model.mask_decoder(extended_features).squeeze(1).transpose(1, 2)
             est_pha = self.model.phase_decoder(extended_features).squeeze(1).transpose(1, 2)
+
+        mask = mask[:, :self.output_frequency_bins, :]
+        est_pha = est_pha[:, :self.output_frequency_bins, :]
+        extended_mag = extended_mag[:, :self.output_frequency_bins, :]
 
         # Apply mask
         infer_type = getattr(self.model, 'infer_type', 'masking')

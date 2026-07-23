@@ -23,7 +23,8 @@ def evaluate(
     data_loader_list: Dict[str, DataLoader],
     logger: logging.Logger,
     epoch: Optional[int] = None,
-    stft_args: Optional[Dict[str, Any]] = None
+    stft_args: Optional[Dict[str, Any]] = None,
+    latency_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Model evaluation
@@ -56,7 +57,10 @@ def evaluate(
                 noisy, clean, _, _ = data
 
                 noisy_com = mag_pha_stft(noisy, **stft_args)[2].to(args.device)
-                clean_mag_hat, clean_pha_hat, _ = model(noisy_com)
+                if latency_id is not None:
+                    clean_mag_hat, clean_pha_hat, _ = model(noisy_com, latency_id=latency_id)
+                else:
+                    clean_mag_hat, clean_pha_hat, _ = model(noisy_com)
 
                 clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **stft_args)
 
@@ -99,6 +103,8 @@ if __name__=="__main__":
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu).")
     parser.add_argument("--num_workers", type=int, default=5, help="Number of workers.")
     parser.add_argument("--log_file", type=str, default="output.log", help="Log file name.")
+    parser.add_argument("--latency_id", type=str, default=None,
+                        help="Latency id for latency-expert checkpoints.")
 
     args = parser.parse_args()
     device = args.device
@@ -140,6 +146,8 @@ if __name__=="__main__":
     logger.info(f"Dataset: VoiceBank-DEMAND")
     logger.info(f"Model: Backbone")
     logger.info(f"Checkpoint: {args.chkpt_dir}")
+    if args.latency_id:
+        logger.info(f"Latency id: {args.latency_id}")
     logger.info(f"Device: {device}")
 
     evaluate(args=conf,
@@ -147,4 +155,5 @@ if __name__=="__main__":
             data_loader_list=ev_loader_list,
             logger=logger,
             epoch=None,
-            stft_args=stft_args)
+            stft_args=stft_args,
+            latency_id=args.latency_id)

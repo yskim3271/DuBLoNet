@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 *.log
 *.out
+logs/
+reports/
 results/
 data/
 demo/

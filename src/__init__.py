@@ -18,12 +18,19 @@ Executable Scripts:
 
 __version__ = "0.1.0"
 
-# Core library imports
-from .data import *
-from .solver import Solver
-from .stft import *
-from .utils import *
-
 __all__ = [
     'Solver',
 ]
+
+
+def __getattr__(name):
+    """Load tensor-runtime components only when they are explicitly requested.
+
+    Keeping package initialization lightweight allows pure configuration and
+    operating-grid contracts to be validated without installing PyTorch.
+    """
+    if name == "Solver":
+        from .solver import Solver
+
+        return Solver
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -19,13 +19,40 @@ def _validate_padding_ratio(padding_ratio, name="padding_ratio"):
     assert 0.0 <= left <= 1.0 and 0.0 <= right <= 1.0, \
         f"{name} values must be in [0, 1], got ({left}, {right})"
 
+
+class ChannelLayerNorm2d(nn.Module):
+    """Normalize only the channel axis of a ``[B, C, T, F]`` tensor.
+
+    Statistics are computed independently at every time-frequency position,
+    so the layer is streaming-safe and does not depend on the current number
+    of frequency bins.  Unlike BatchNorm2d it cannot be folded into a Conv2d.
+    """
+
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(dim=1, keepdim=True)
+        variance = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        normalized = (x - mean) * torch.rsqrt(variance + self.eps)
+        return normalized * self.weight + self.bias
+
+
 def _make_norm2d(num_features, norm_type="batch"):
     if norm_type == "batch":
         return nn.BatchNorm2d(num_features)
     elif norm_type == "instance":
         return nn.InstanceNorm2d(num_features, affine=True)
+    elif norm_type in {"channel", "channel_layer", "channel_layer_norm"}:
+        return ChannelLayerNorm2d(num_features)
     else:
-        raise ValueError(f"Unknown norm_type: {norm_type} (expected 'batch' or 'instance')")
+        raise ValueError(
+            f"Unknown norm_type: {norm_type} "
+            "(expected 'batch', 'instance', or 'channel_layer')"
+        )
 
 class CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, stride=1, dilation=1, groups=1, bias=True):
@@ -352,6 +379,17 @@ class LearnableSigmoid_2d(nn.Module):
     def forward(self, x):
         return self.beta * torch.sigmoid(self.slope * x)
 
+
+class FixedMaskGate(nn.Module):
+    """Frequency-size-independent ``beta * sigmoid(x)`` mask gate."""
+
+    def __init__(self, beta=2.0):
+        super().__init__()
+        self.beta = float(beta)
+
+    def forward(self, x):
+        return self.beta * torch.sigmoid(x)
+
 class DS_DDB(nn.Module):
     """
     Dense Dilated Depthwise Block with asymmetric padding support.
@@ -455,7 +493,8 @@ class MaskDecoder(nn.Module):
                  depth=4,
                  causal=False,
                  padding_ratio=(0.5, 0.5),
-                 norm_type="batch"):
+                 norm_type="batch",
+                 mask_gate="learnable"):
         super().__init__()
         self.n_fft = n_fft
         self.dense_block = DS_DDB(dense_channel, depth=depth, causal=causal, padding_ratio=padding_ratio, norm_type=norm_type)
@@ -466,7 +505,14 @@ class MaskDecoder(nn.Module):
             nn.PReLU(out_channel),
             nn.Conv2d(out_channel, out_channel, (1, 1))
         )
-        self.lsigmoid = LearnableSigmoid_2d(n_fft//2+1, beta=sigmoid_beta)
+        if mask_gate == "fixed":
+            self.lsigmoid = FixedMaskGate(beta=sigmoid_beta)
+        elif mask_gate == "learnable":
+            self.lsigmoid = LearnableSigmoid_2d(n_fft//2+1, beta=sigmoid_beta)
+        else:
+            raise ValueError(
+                f"Unknown mask_gate '{mask_gate}' (expected 'learnable' or 'fixed')"
+            )
 
     def forward(self, x):
         x = self.dense_block(x)
@@ -554,7 +600,8 @@ class Backbone(nn.Module):
                  encoder_padding_ratio=(0.5, 0.5),
                  decoder_padding_ratio=(0.5, 0.5),
                  sca_kernel_size=11,
-                 norm_type="batch"
+                 norm_type="batch",
+                 sfi=None,
                  ):
         super().__init__()
         self.win_len = win_len
@@ -566,6 +613,16 @@ class Backbone(nn.Module):
         self.compress_factor = compress_factor
         self.num_tsblock = num_tsblock
         self.causal_ts_block = causal_ts_block
+        self.sfi = sfi or {}
+        self.sfi_enabled = bool(self.sfi.get("enabled", False))
+        self.pad_even_frequency = bool(
+            self.sfi.get("pad_even_frequency", self.sfi_enabled)
+        )
+        self.mask_gate_type = (
+            "fixed"
+            if self.sfi.get("fixed_mask_gate", self.sfi_enabled)
+            else "learnable"
+        )
 
         _validate_padding_ratio(encoder_padding_ratio, "encoder_padding_ratio")
         _validate_padding_ratio(decoder_padding_ratio, "decoder_padding_ratio")
@@ -583,13 +640,20 @@ class Backbone(nn.Module):
         )
         self.mask_decoder = MaskDecoder(dense_channel, fft_len, sigmoid_beta, out_channel=1,
                                        depth=dense_depth, causal=causal_ts_block, padding_ratio=decoder_padding_ratio,
-                                       norm_type=norm_type)
+                                       norm_type=norm_type, mask_gate=self.mask_gate_type)
         self.phase_decoder = PhaseDecoder(dense_channel, out_channel=1, depth=dense_depth,
                                          causal=causal_ts_block, padding_ratio=decoder_padding_ratio,
                                          norm_type=norm_type)
 
     def forward(self, noisy_com):
         # Input shape: [B, F, T, 2]
+        original_frequency_bins = noisy_com.shape[1]
+        if self.pad_even_frequency and original_frequency_bins % 2 == 0:
+            pad = noisy_com.new_zeros(
+                noisy_com.shape[0], 1, noisy_com.shape[2], noisy_com.shape[3]
+            )
+            noisy_com = torch.cat((noisy_com, pad), dim=1)
+
         mag, pha = complex_to_mag_pha(noisy_com, stack_dim=-1)  # [B, F, T] each
 
         x = torch.stack((mag, pha), dim=1).permute(0, 1, 3, 2)  # [B, 2, T, F]
@@ -598,9 +662,12 @@ class Backbone(nn.Module):
 
         # mask_decoder output: [B, 1, T, F] -> squeeze/transpose -> [B, F, T]
         mask = self.mask_decoder(x).squeeze(1).transpose(1, 2)
+        mask = mask[:, :original_frequency_bins, :]
+        mag = mag[:, :original_frequency_bins, :]
         est_mag = mag * mask  # [B, F, T]
 
         est_pha = self.phase_decoder(x).squeeze(1).transpose(1, 2)  # [B, F, T]
+        est_pha = est_pha[:, :original_frequency_bins, :]
         est_com = mag_pha_to_complex(est_mag, est_pha, stack_dim=-1)
 
         return est_mag, est_pha, est_com

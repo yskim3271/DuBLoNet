@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - lacosenet_v2_sfi_bn
+  - _self_
+
+# Candidate B in the locked normalization A/B.  Channel-only LN is streaming
+# safe and frequency-size independent, but cannot be folded into Conv2d.
+model:
+  norm_type: channel_layer
+  latency_expert:
+    expert_scope: dsddb_only
