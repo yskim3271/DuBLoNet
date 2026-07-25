@@ -6,7 +6,9 @@ defaults:
 # Dataset
 dset:
   hf_dataset_id: JacobLinCool/VoiceBank-DEMAND-16k
-  segment: auto
+  # Keep the released training recipe fixed at a 1.0 s crop. Receptive-field
+  # reporting is intentionally decoupled from the training segment length.
+  segment: 16000
 
 # Model
 model:

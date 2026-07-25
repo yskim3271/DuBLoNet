@@ -1,12 +1,12 @@
 """Receptive field calculator for Backbone.
 
-Computes the theoretical (convolutional) receptive field size
-from model config parameters, broken down by component.
+Computes the theoretical temporal receptive field size from model config
+parameters, broken down by component.
 
 Usage:
     from src.receptive_field import compute_receptive_field
 
-    rf = compute_receptive_field(cfg.model.param)
+    rf = compute_receptive_field(cfg.model)
     rf.summary()
 """
 
@@ -32,6 +32,8 @@ class ReceptiveFieldResult:
     hop_len: int = 100
     win_len: int = 400
     sampling_rate: int = 16000
+    causal_ts_block: bool = False
+    global_time_dependency: bool = False
 
     @property
     def total_rf_samples(self) -> int:
@@ -43,6 +45,11 @@ class ReceptiveFieldResult:
 
     @property
     def one_sided_rf_frames(self) -> float:
+        """Symmetric-equivalent half span.
+
+        This value is not a past/future context split when the temporal path is
+        causal or otherwise asymmetric.
+        """
         return (self.total_rf_frames - 1) / 2
 
     @property
@@ -71,12 +78,23 @@ class ReceptiveFieldResult:
         lines.append(f"  RF (samples)       : {self.total_rf_samples}")
         lines.append(f"  RF (ms)            : {self.total_rf_ms:.1f}")
         lines.append(f"  RF (sec)           : {self.total_rf_ms / 1000:.4f}")
-        lines.append(f"  One-sided (frames) : {self.one_sided_rf_frames:.1f}")
-        lines.append(f"  One-sided (ms)     : {self.one_sided_rf_ms:.1f}")
 
         lines.append("")
-        lines.append("Global Operations (make actual RF = full sequence):")
-        lines.append("  - AdaptiveAvgPool1d in SCA (TS_BLOCK)")
+        if self.global_time_dependency:
+            lines.append("Actual temporal dependency: full input sequence")
+            lines.append("  - Non-causal time-stage SCA uses AdaptiveAvgPool1d")
+        else:
+            lines.append("Actual temporal dependency: finite convolutional RF")
+            if self.causal_ts_block:
+                lines.append(
+                    "  - Time-stage SCA uses a local causal depthwise convolution"
+                )
+                lines.append(
+                    "  - Past/future split is asymmetric; only total span is reported"
+                )
+        lines.append(
+            "  - Frequency-stage pooling is global over frequency, not time"
+        )
         lines.append("=" * 62)
         return "\n".join(lines)
 
@@ -102,8 +120,20 @@ def _encoder_rf(dense_depth: int, kernel_size: int = 3) -> int:
     return _ds_ddb_rf(kernel_size, dense_depth)
 
 
-def _cab_rf(dw_kernel_size: int) -> int:
-    """Channel_Attention_Block local conv RF (excluding SCA global pooling)."""
+def _cab_rf(
+    dw_kernel_size: int,
+    causal: bool,
+    sca_kernel_size: int,
+) -> int:
+    """Channel_Attention_Block temporal RF.
+
+    In the causal implementation, the depthwise convolution is followed by a
+    local SCA depthwise convolution. Their receptive-field increments therefore
+    accumulate. In the non-causal implementation SCA uses global average
+    pooling, so the returned value represents only the local pre-pooling path.
+    """
+    if causal:
+        return (dw_kernel_size - 1) + (sca_kernel_size - 1) + 1
     return dw_kernel_size
 
 
@@ -120,6 +150,8 @@ def _ts_block_time_rf(
     time_block_num: int,
     time_dw_kernel_size: int,
     time_block_kernel: Sequence[int],
+    causal: bool,
+    sca_kernel_size: int,
 ) -> int:
     """One TS_BLOCK's time-axis RF.
 
@@ -127,7 +159,7 @@ def _ts_block_time_rf(
     Repeated time_block_num times.
     Freq stage does not affect time RF.
     """
-    cab_rf = _cab_rf(time_dw_kernel_size)
+    cab_rf = _cab_rf(time_dw_kernel_size, causal, sca_kernel_size)
     gpkffn_rf = _gpkffn_rf(time_block_kernel)
     one_iter_rf = (cab_rf - 1) + (gpkffn_rf - 1) + 1
     return time_block_num * (one_iter_rf - 1) + 1
@@ -156,7 +188,9 @@ def compute_receptive_field(
             - num_tsblock (int): Number of TS_BLOCKs (default: 4)
             - time_block_num (int): Iterations per TS_BLOCK time stage (default: 2)
             - time_dw_kernel_size (int): CAB depthwise kernel size (default: 3)
-            - time_block_kernel (list[int]): GPKFFN kernel list (default: [3,11,23,31])
+            - sca_kernel_size (int): Causal SCA kernel size (default: 11)
+            - time_block_kernel (list[int]): GPKFFN kernel list (default: [3,5,7,11])
+            - causal_ts_block (bool): Whether the time stage is causal (default: False)
             - hop_len (int): STFT hop length (default: 100)
             - win_len (int): STFT window length (default: 400)
         hop_len: Override hop_len from param.
@@ -175,20 +209,32 @@ def compute_receptive_field(
     num_tsblock = _get("num_tsblock", 4)
     time_block_num = _get("time_block_num", 2)
     time_dw_kernel_size = _get("time_dw_kernel_size", 3)
-    time_block_kernel = list(_get("time_block_kernel", [3, 11, 23, 31]))
+    sca_kernel_size = _get("sca_kernel_size", 11)
+    causal_ts_block = bool(_get("causal_ts_block", False))
+    time_block_kernel = list(_get("time_block_kernel", [3, 5, 7, 11]))
     _hop = hop_len or _get("hop_len", 100)
     _win = win_len or _get("win_len", 400)
 
     # Component RFs
     enc_rf = _encoder_rf(dense_depth)
-    one_ts_rf = _ts_block_time_rf(time_block_num, time_dw_kernel_size, time_block_kernel)
+    one_ts_rf = _ts_block_time_rf(
+        time_block_num,
+        time_dw_kernel_size,
+        time_block_kernel,
+        causal_ts_block,
+        sca_kernel_size,
+    )
     all_ts_rf = num_tsblock * (one_ts_rf - 1) + 1
     dec_rf = _decoder_rf(dense_depth)
 
     total_rf = (enc_rf - 1) + (all_ts_rf - 1) + (dec_rf - 1) + 1
 
     # Build component list
-    cab_rf = _cab_rf(time_dw_kernel_size)
+    cab_rf = _cab_rf(
+        time_dw_kernel_size,
+        causal_ts_block,
+        sca_kernel_size,
+    )
     gpkffn_rf = _gpkffn_rf(time_block_kernel)
     one_iter_rf = (cab_rf - 1) + (gpkffn_rf - 1) + 1
 
@@ -202,7 +248,8 @@ def compute_receptive_field(
             f"TS_BLOCK x{num_tsblock}",
             all_ts_rf,
             f"per block={one_ts_rf} "
-            f"(CAB(k={time_dw_kernel_size})={cab_rf} + "
+            f"(CAB(dw={time_dw_kernel_size}, "
+            f"SCA={'global' if not causal_ts_block else sca_kernel_size})={cab_rf} + "
             f"GPKFFN(max={max(time_block_kernel)})={gpkffn_rf} "
             f"-> iter={one_iter_rf}, x{time_block_num}iter={one_ts_rf})",
         ),
@@ -219,6 +266,10 @@ def compute_receptive_field(
         hop_len=_hop,
         win_len=_win,
         sampling_rate=sampling_rate,
+        causal_ts_block=causal_ts_block,
+        global_time_dependency=(
+            not causal_ts_block and num_tsblock > 0 and time_block_num > 0
+        ),
     )
 
 
@@ -233,6 +284,11 @@ def rf_to_segment(
     Returns RF in samples, aligned up to the nearest multiple of hop_len.
     """
     rf = compute_receptive_field(param, hop_len, win_len, sampling_rate)
+    if rf.global_time_dependency:
+        raise ValueError(
+            "Cannot derive a finite RF-sized segment when non-causal "
+            "time-stage SCA depends on the full input sequence"
+        )
     hop = rf.hop_len
     samples = rf.total_rf_samples
     # Align up to hop_len multiple
@@ -248,7 +304,13 @@ if __name__ == "__main__":
     parser.add_argument("--num-tsblock", type=int, default=4)
     parser.add_argument("--time-block-num", type=int, default=2)
     parser.add_argument("--time-dw-kernel-size", type=int, default=3)
-    parser.add_argument("--time-block-kernel", type=int, nargs="+", default=[3, 11, 23, 31])
+    parser.add_argument("--sca-kernel-size", type=int, default=11)
+    parser.add_argument("--time-block-kernel", type=int, nargs="+", default=[3, 5, 7, 11])
+    parser.add_argument(
+        "--causal-ts-block",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--hop-len", type=int, default=100)
     parser.add_argument("--win-len", type=int, default=400)
     parser.add_argument("--sampling-rate", type=int, default=16000)
@@ -260,6 +322,8 @@ if __name__ == "__main__":
             "num_tsblock": args.num_tsblock,
             "time_block_num": args.time_block_num,
             "time_dw_kernel_size": args.time_dw_kernel_size,
+            "sca_kernel_size": args.sca_kernel_size,
+            "causal_ts_block": args.causal_ts_block,
             "time_block_kernel": args.time_block_kernel,
             "hop_len": args.hop_len,
             "win_len": args.win_len,
